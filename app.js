@@ -45,15 +45,18 @@ const state = {
   currentMatchIndex: 0,
   currentMatchId: null,
   currentSummary: null,
+  selectedPeriod: 'ALL', // 'ALL' or period number / game number (1, 2, 3, 4, 5...)
+  lolGamesCache: new Map(), // matchId -> { eventDetail, games, windowByGameNum: Map }
   pbpFilter: 'all', // 'all' | 'scoring'
-  statView: 'team', // 'team' | 'leaders'
+  statView: 'boxscore', // 'boxscore' | 'team' | 'leaders'
   autoRotate: true,
   rotateIntervalSec: 25,
   rotateElapsedMs: 0,
   danmakuEnabled: true,
-  previousScores: new Map(), // matchId -> { away, home }
+  modalOpen: false,
+  previousScores: new Map(),
   announcedPlayIds: new Set(),
-  chatHistoryByMatch: new Map(), // matchId -> Array of messages
+  chatHistoryByMatch: new Map(),
 };
 
 // DOM Elements
@@ -77,6 +80,7 @@ const els = {
   currentVenueText: document.getElementById('current-venue-text'),
   currentStateBadge: document.getElementById('current-state-badge'),
   currentClockText: document.getElementById('current-clock-text'),
+  btnOpenDatacenter: document.getElementById('btn-open-datacenter'),
 
   awayTeamLogo: document.getElementById('away-team-logo'),
   awayTeamFallback: document.getElementById('away-team-fallback'),
@@ -96,6 +100,7 @@ const els = {
 
   matchSituationPill: document.getElementById('match-situation-pill'),
   lastPlayBanner: document.getElementById('last-play-banner'),
+  gamePeriodBar: document.getElementById('game-period-bar'),
   linescoreWrapper: document.getElementById('linescore-wrapper'),
   momentumAwayLabel: document.getElementById('momentum-away-label'),
   momentumHomeLabel: document.getElementById('momentum-home-label'),
@@ -103,9 +108,12 @@ const els = {
   momentumFillHome: document.getElementById('momentum-fill-home'),
 
   // Lower Panels
+  pbpSubtitleTag: document.getElementById('pbp-subtitle-tag'),
   pbpFilterAll: document.getElementById('pbp-filter-all'),
   pbpFilterScoring: document.getElementById('pbp-filter-scoring'),
   pbpFeedList: document.getElementById('pbp-feed-list'),
+  statsSubtitleTag: document.getElementById('stats-subtitle-tag'),
+  statTabBoxscore: document.getElementById('stat-tab-boxscore'),
   statTabTeam: document.getElementById('stat-tab-team'),
   statTabLeaders: document.getElementById('stat-tab-leaders'),
   statsContentArea: document.getElementById('stats-content-area'),
@@ -131,6 +139,15 @@ const els = {
   // Telemetry
   telemetryPoolSummary: document.getElementById('telemetry-pool-summary'),
   telemetryLastSync: document.getElementById('telemetry-last-sync'),
+
+  // Deep-Dive Modal
+  datacenterModal: document.getElementById('datacenter-modal'),
+  modalLeaguePill: document.getElementById('modal-league-pill'),
+  modalMatchTitle: document.getElementById('modal-match-title'),
+  modalMatchSubtitle: document.getElementById('modal-match-subtitle'),
+  modalPeriodBar: document.getElementById('modal-period-bar'),
+  datacenterModalBody: document.getElementById('datacenter-modal-body'),
+  btnCloseDatacenter: document.getElementById('btn-close-datacenter'),
 };
 
 /* ==========================================================================
@@ -156,7 +173,7 @@ function normalizeEspnEvent(ev, leagueCfg) {
 
   const statusObj = ev.status || comp.status || {};
   const statusType = statusObj.type || {};
-  const matchState = statusType.state || 'pre'; // 'in' | 'pre' | 'post'
+  const matchState = statusType.state || 'pre';
 
   const formatTeam = (c, fallbackAbbr) => {
     const t = c.team || {};
@@ -268,14 +285,11 @@ async function fetchAllLoLEsportsMatches() {
   }
   if (worldsRes.status === 'fulfilled') {
     const wEvents = worldsRes.value?.data?.schedule?.events || [];
-    // Take recent & upcoming Worlds / MSI / International matches
     rawEvents.push(...wEvents.slice(-30));
   }
   if (proRes.status === 'fulfilled') {
     const pEvents = proRes.value?.data?.schedule?.events || [];
-    // Prioritize inProgress, unstarted, and recent completed pro matches
-    const activeOrRecent = pEvents.slice(-45);
-    rawEvents.push(...activeOrRecent);
+    rawEvents.push(...pEvents.slice(-45));
   }
 
   const seenMatchIds = new Set();
@@ -349,7 +363,6 @@ function normalizeLoLEvent(ev) {
   const rWins = parseInt(redTeam.score, 10) || 0;
   const totalGames = bWins + rWins;
 
-  // Build per-map linescores from series score until getEventDetails populates exact maps
   const mapCount = Math.max(totalGames, matchState === 'in' ? totalGames + 1 : 0);
   for (let i = 0; i < mapCount; i++) {
     if (i < bWins) {
@@ -395,13 +408,13 @@ function normalizeLoLEvent(ev) {
     displayClock: blockName,
     period: totalGames + 1,
     venue: `${leagueObj.name || 'LoL Esports'} · 召喚師峽谷官方轉播台 (${blockName})`,
-    away: blueTeam, // Blue Side
-    home: redTeam, // Red Side
+    away: blueTeam,
+    home: redTeam,
     situation: { boLabel, blockName },
     lastPlayText:
       matchState === 'in'
-        ? `正在進行 ${leagueDisplayName} (${blockName}) 峽谷對決！`
-        : `${leagueDisplayName} · ${blockName} 系列賽 (${blueTeam.fullName} vs ${redTeam.fullName})`,
+        ? `正在進行 ${leagueDisplayName} (${blockName}) 峽谷對決！點擊下方各局可查看單局英雄與詳細戰報。`
+        : `${leagueDisplayName} · ${blockName} 系列賽 (${blueTeam.fullName} vs ${redTeam.fullName}) — 點擊下方各局進入該局數據`,
     awayWinPct,
     homeWinPct,
     compLeaders: [],
@@ -518,9 +531,13 @@ function applyLeagueFilter(preserveSelection = true) {
     state.currentMatchIndex = idx >= 0 ? idx : 0;
   } else {
     state.currentMatchIndex = 0;
+    state.selectedPeriod = 'ALL';
   }
 
   const activeMatch = state.filteredMatches[state.currentMatchIndex];
+  if (state.currentMatchId !== activeMatch.id) {
+    state.selectedPeriod = 'ALL';
+  }
   state.currentMatchId = activeMatch.id;
 
   renderTickerStrip();
@@ -549,7 +566,7 @@ function renderTickerStrip() {
           : escapeHtml(m.statusDetail || formatMatchTime(m.date));
 
       return `
-        <article class="ticker-card ${isSelected ? 'selected' : ''}" data-match-idx="${idx}" id="ticker-card-${m.id}">
+        <article class="ticker-card ${isSelected ? 'selected' : ''}" data-match-idx="${idx}" id="ticker-card-${m.id}" title="點擊切換至此場比賽並查看完整數據">
           <div class="ticker-card-top">
             <span class="ticker-league-tag">${escapeHtml(m.leagueLabel)}</span>
             <span class="ticker-status ${stateClass}">${badgeLabel}</span>
@@ -586,7 +603,18 @@ function renderTickerStrip() {
   els.tickerStrip.querySelectorAll('.ticker-card').forEach((card) => {
     card.addEventListener('click', () => {
       const idx = Number(card.getAttribute('data-match-idx'));
+      const wasSelected = state.currentMatchIndex === idx;
+      // Pause auto-rotation when user explicitly clicks a match to inspect its data
+      if (state.autoRotate) {
+        state.autoRotate = false;
+        els.btnToggleRotate.classList.remove('active');
+        els.rotateIcon.innerHTML = '&#9654;';
+        updateRotationProgressUI();
+      }
       selectMatchByIndex(idx, true);
+      if (wasSelected) {
+        openDataCenterModal();
+      }
     });
   });
 }
@@ -596,9 +624,14 @@ function selectMatchByIndex(idx, resetTimer = true) {
   const normalizedIdx =
     ((idx % state.filteredMatches.length) + state.filteredMatches.length) %
     state.filteredMatches.length;
-  state.currentMatchIndex = normalizedIdx;
   const match = state.filteredMatches[normalizedIdx];
+  if (state.currentMatchId !== match.id) {
+    state.selectedPeriod = 'ALL';
+    state.currentSummary = null;
+  }
+  state.currentMatchIndex = normalizedIdx;
   state.currentMatchId = match.id;
+
   if (resetTimer) {
     state.rotateElapsedMs = 0;
     updateRotationProgressUI();
@@ -630,7 +663,6 @@ function renderCurrentMatchJumbotron(match) {
     els.currentClockText.textContent = match.statusDetail || '終場';
   }
 
-  // Team Logos & Names
   setTeamLogo(els.awayTeamLogo, els.awayTeamFallback, match.away.logo, match.away.abbr);
   setTeamLogo(els.homeTeamLogo, els.homeTeamFallback, match.home.logo, match.home.abbr);
 
@@ -649,7 +681,6 @@ function renderCurrentMatchJumbotron(match) {
   els.awayTeamAbbr.textContent = match.away.abbr;
   els.homeTeamAbbr.textContent = match.home.abbr;
 
-  // Score & Flash Detection
   const prev = state.previousScores.get(match.id);
   const displayAwayScore = match.state === 'pre' ? '-' : match.away.score;
   const displayHomeScore = match.state === 'pre' ? '-' : match.home.score;
@@ -669,21 +700,17 @@ function renderCurrentMatchJumbotron(match) {
   }
   state.previousScores.set(match.id, { away: displayAwayScore, home: displayHomeScore });
 
-  // Situation Pill & Last Play
   els.matchSituationPill.textContent = formatSituationText(match);
   els.lastPlayBanner.textContent =
     match.lastPlayText ||
     (match.state === 'pre'
       ? `開賽時間：${formatFullDateTime(match.date)}`
-      : '等待現場最新戰況訊號...');
+      : '點擊下方局數或文字動態可查看單局/單節深度數據');
 
-  // Linescore Table
+  renderPeriodSelectorBar(match);
   renderLinescoreTable(match);
-
-  // Momentum Bar
   updateMomentumUI(match.away.abbr, match.home.abbr, match.awayWinPct, match.homeWinPct);
 
-  // Update Poll & Chat for this Match
   renderPollForMatch(match);
   ensureChatInitializedForMatch(match);
   renderChatMessages(match.id);
@@ -717,7 +744,9 @@ function triggerScoreFlash(el) {
 function formatSituationText(match) {
   const s = match.situation || {};
   if (match.isEsports) {
-    return `${match.leagueLabel} · ${match.blockName || 'BO3/BO5 系列賽'}`;
+    const selLabel =
+      state.selectedPeriod === 'ALL' ? '系列賽總覽' : `目前檢視：Game ${state.selectedPeriod}`;
+    return `${match.leagueLabel} · ${match.blockName || 'BO3/BO5'} (${selLabel})`;
   }
   if (match.state === 'pre') {
     return `表定開賽：${formatFullDateTime(match.date)}`;
@@ -738,6 +767,122 @@ function formatSituationText(match) {
     return `${match.statusDetail} · ${s.downDistanceText}`;
   }
   return `${match.leagueLabel} · ${match.statusDetail || (match.state === 'post' ? '終場完賽' : '即時賽況')}`;
+}
+
+/* ==========================================================================
+   2B. Interactive Game / Period / Inning Selector & Linescore Table
+   ========================================================================== */
+
+function getAvailablePeriodsForMatch(match) {
+  const items = [{ key: 'ALL', label: match.isEsports ? '全系列賽總覽' : '全場數據總覽' }];
+
+  if (match.isEsports) {
+    const cached = state.lolGamesCache.get(match.id);
+    const games = (cached && cached.games) || [];
+    const count = Math.max(games.length, match.boCount || 3);
+    for (let i = 1; i <= count; i++) {
+      const gObj = games.find((g) => Number(g.number) === i);
+      const stateTag =
+        gObj && gObj.state === 'inProgress'
+          ? ' (LIVE)'
+          : gObj && gObj.state === 'completed'
+          ? ' (完賽)'
+          : '';
+      items.push({ key: String(i), label: `Game ${i}${stateTag}` });
+    }
+    return items;
+  }
+
+  const maxLines = Math.max(
+    (match.away.linescores || []).length,
+    (match.home.linescores || []).length,
+    match.period || 0
+  );
+
+  if (match.isSoccer) {
+    items.push({ key: '1', label: '上半場 (1st Half)' });
+    items.push({ key: '2', label: '下半場 (2nd Half)' });
+  } else if (match.leagueKey === 'mlb') {
+    const innings = Math.max(maxLines, 9);
+    for (let i = 1; i <= innings; i++) {
+      items.push({ key: String(i), label: `第 ${i} 局` });
+    }
+  } else if (match.leagueKey === 'nhl') {
+    const periods = Math.max(maxLines, 3);
+    for (let i = 1; i <= periods; i++) {
+      items.push({ key: String(i), label: i > 3 ? `OT${i - 3}` : `第 ${i} 節` });
+    }
+  } else {
+    const quarters = Math.max(maxLines, 4);
+    for (let i = 1; i <= quarters; i++) {
+      items.push({ key: String(i), label: i > 4 ? `OT${i - 4}` : `第 ${i} 節` });
+    }
+  }
+
+  return items;
+}
+
+function renderPeriodSelectorBar(match) {
+  const periods = getAvailablePeriodsForMatch(match);
+  const html = `
+    <span class="period-bar-label">${match.isEsports ? '切換單局數據：' : '點擊節數/局數篩選數據：'}</span>
+    ${periods
+      .map(
+        (p) => `
+      <button type="button" class="period-chip ${String(state.selectedPeriod) === String(p.key) ? 'active' : ''}" data-period-key="${escapeAttr(p.key)}">
+        ${escapeHtml(p.label)}
+      </button>
+    `
+      )
+      .join('')}
+  `;
+
+  els.gamePeriodBar.innerHTML = html;
+  els.gamePeriodBar.querySelectorAll('.period-chip').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const pKey = btn.getAttribute('data-period-key') || 'ALL';
+      selectPeriodOrGame(pKey, false);
+    });
+  });
+
+  if (els.modalPeriodBar) {
+    els.modalPeriodBar.innerHTML = html;
+    els.modalPeriodBar.querySelectorAll('.period-chip').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const pKey = btn.getAttribute('data-period-key') || 'ALL';
+        selectPeriodOrGame(pKey, true);
+      });
+    });
+  }
+}
+
+async function selectPeriodOrGame(periodKey, fromModal = false) {
+  state.selectedPeriod = String(periodKey);
+  const match = state.filteredMatches[state.currentMatchIndex];
+  if (!match) return;
+
+  // Pause carousel so user can inspect the selected game/period freely
+  if (state.autoRotate) {
+    state.autoRotate = false;
+    els.btnToggleRotate.classList.remove('active');
+    els.rotateIcon.innerHTML = '&#9654;';
+    updateRotationProgressUI();
+  }
+
+  els.matchSituationPill.textContent = formatSituationText(match);
+  renderPeriodSelectorBar(match);
+  renderLinescoreTable(match);
+
+  if (match.provider === 'lolesports') {
+    await fetchAndRenderLoLSummary(match);
+  } else {
+    renderPlayByPlay(match, state.currentSummary);
+    renderTechnicalStats(match, state.currentSummary);
+  }
+
+  if (state.modalOpen || fromModal) {
+    renderDataCenterModalContent(match);
+  }
 }
 
 function renderLinescoreTable(match) {
@@ -774,16 +919,26 @@ function renderLinescoreTable(match) {
 
   const headers = [];
   for (let i = 0; i < maxCols; i++) {
+    const pNum = String(i + 1);
+    const activeCls = String(state.selectedPeriod) === pNum ? 'active-col' : '';
     const label = match.isEsports ? `G${i + 1}` : match.isSoccer ? `H${i + 1}` : `${i + 1}`;
-    headers.push(`<th>${label}</th>`);
+    headers.push(
+      `<th class="clickable-col ${activeCls}" data-col-period="${pNum}" title="點擊查看 ${label} 數據">${label}</th>`
+    );
   }
 
   const renderCells = (lines) => {
     const cells = [];
     for (let i = 0; i < maxCols; i++) {
+      const pNum = String(i + 1);
+      const activeCls = String(state.selectedPeriod) === pNum ? 'active-col' : '';
       const val =
         lines[i] && (lines[i].displayValue !== undefined ? lines[i].displayValue : lines[i].value);
-      cells.push(`<td>${val !== undefined ? escapeHtml(String(val)) : '-'}</td>`);
+      cells.push(
+        `<td class="clickable-col ${activeCls}" data-col-period="${pNum}">${
+          val !== undefined ? escapeHtml(String(val)) : '-'
+        }</td>`
+      );
     }
     return cells.join('');
   };
@@ -811,6 +966,15 @@ function renderLinescoreTable(match) {
       </tbody>
     </table>
   `;
+
+  els.linescoreWrapper.querySelectorAll('[data-col-period]').forEach((cell) => {
+    cell.addEventListener('click', () => {
+      const pNum = cell.getAttribute('data-col-period');
+      if (!pNum) return;
+      const nextPeriod = String(state.selectedPeriod) === pNum ? 'ALL' : pNum;
+      selectPeriodOrGame(nextPeriod, false);
+    });
+  });
 }
 
 function updateMomentumUI(awayAbbr, homeAbbr, awayPct, homePct) {
@@ -860,8 +1024,10 @@ async function fetchAndRenderMatchSummary(match) {
       }
     }
 
+    renderPeriodSelectorBar(match);
     renderPlayByPlay(match, summaryData);
     renderTechnicalStats(match, summaryData);
+    if (state.modalOpen) renderDataCenterModalContent(match);
   } catch (err) {
     if (state.currentMatchId !== targetMatchId) return;
     renderPlayByPlay(match, null);
@@ -870,34 +1036,114 @@ async function fetchAndRenderMatchSummary(match) {
 }
 
 /* ==========================================================================
-   3B. Riot LoL Esports EventDetails & LiveStats Window Parser
+   3B. Riot LoL Esports EventDetails & Completed/Live Game Window Probing
    ========================================================================== */
+
+function alignTimestampTo10SecISO(ms) {
+  const aligned = Math.floor(ms / 10000) * 10000;
+  return new Date(aligned).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+async function fetchLoLWindowForGame(match, gameObj) {
+  if (!gameObj || !gameObj.id || gameObj.state === 'unstarted') return null;
+
+  // 1. First try without startingTime (works immediately for inProgress games)
+  try {
+    const directRes = await fetch(`${LOL_LIVESTATS_BASE}/window/${gameObj.id}`, {
+      cache: 'no-store',
+    });
+    if (directRes.ok && directRes.status === 200) {
+      const directData = await directRes.json();
+      if (directData && Array.isArray(directData.frames) && directData.frames.length > 0) {
+        return directData;
+      }
+    }
+  } catch (_) {}
+
+  // 2. For completed games, Riot livestats requires `startingTime` (10s aligned RFC3339) during the game window.
+  // Probe candidate offsets based on series startTime and game number (Game 1 ~ +25m..+45m, Game 2 ~ +80m..+105m, etc.)
+  const baseMs = match.date instanceof Date && !isNaN(match.date.getTime())
+    ? match.date.getTime()
+    : Date.now() - 7200000;
+  const gIndex = Math.max(0, (Number(gameObj.number) || 1) - 1);
+  const estGameStartMin = gIndex * 54;
+  const offsetsMin = [22, 32, 42, 14, 52].map((m) => estGameStartMin + m);
+
+  const probePromises = offsetsMin.map(async (minOffset) => {
+    const iso = alignTimestampTo10SecISO(baseMs + minOffset * 60000);
+    const url = `${LOL_LIVESTATS_BASE}/window/${gameObj.id}?startingTime=${encodeURIComponent(iso)}`;
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok || res.status === 204) return null;
+    const data = await res.json();
+    if (data && Array.isArray(data.frames) && data.frames.length > 0) {
+      return data;
+    }
+    return null;
+  });
+
+  const probeResults = await Promise.allSettled(probePromises);
+  let bestWindow = null;
+  let maxGoldSum = -1;
+
+  probeResults.forEach((r) => {
+    if (r.status === 'fulfilled' && r.value) {
+      const frames = r.value.frames;
+      const last = frames[frames.length - 1];
+      const goldSum =
+        Number(last?.blueTeam?.totalGold || 0) + Number(last?.redTeam?.totalGold || 0);
+      if (goldSum > maxGoldSum) {
+        maxGoldSum = goldSum;
+        bestWindow = r.value;
+      }
+    }
+  });
+
+  return bestWindow;
+}
 
 async function fetchAndRenderLoLSummary(match) {
   const targetMatchId = match.id;
   try {
-    const detailsData = await fetchLoLEsportsJson(`getEventDetails?hl=zh-TW&id=${match.id}`);
+    let cached = state.lolGamesCache.get(match.id);
+    if (!cached) {
+      const detailsData = await fetchLoLEsportsJson(`getEventDetails?hl=zh-TW&id=${match.id}`);
+      const eventDetail = detailsData?.data?.event || {};
+      const games = eventDetail?.match?.games || [];
+      cached = {
+        eventDetail,
+        games,
+        windowByGameNum: new Map(),
+      };
+      state.lolGamesCache.set(match.id, cached);
+    }
+
     if (state.currentMatchId !== targetMatchId) return;
 
-    const eventDetail = detailsData?.data?.event || {};
-    const games = eventDetail?.match?.games || [];
+    const { eventDetail, games, windowByGameNum } = cached;
 
-    // Find inProgress game, or the latest completed game
-    const activeGame =
-      games.find((g) => g.state === 'inProgress') ||
-      [...games].reverse().find((g) => g.state === 'completed') ||
-      games[0];
+    // Determine which game to inspect: user-selected game, or inProgress game, or latest completed game
+    let targetGame = null;
+    if (state.selectedPeriod !== 'ALL') {
+      const wantedNum = Number(state.selectedPeriod);
+      targetGame = games.find((g) => Number(g.number) === wantedNum) || null;
+    }
+    if (!targetGame) {
+      targetGame =
+        games.find((g) => g.state === 'inProgress') ||
+        [...games].reverse().find((g) => g.state === 'completed') ||
+        games[0];
+    }
 
     let windowData = null;
-    if (activeGame && activeGame.id && activeGame.state !== 'unstarted') {
-      try {
-        const winRes = await fetch(`${LOL_LIVESTATS_BASE}/window/${activeGame.id}`, {
-          cache: 'no-store',
-        });
-        if (winRes.ok) {
-          windowData = await winRes.json();
+    if (targetGame && targetGame.number) {
+      if (windowByGameNum.has(targetGame.number) && targetGame.state === 'completed') {
+        windowData = windowByGameNum.get(targetGame.number);
+      } else {
+        windowData = await fetchLoLWindowForGame(match, targetGame);
+        if (windowData) {
+          windowByGameNum.set(targetGame.number, windowData);
         }
-      } catch (_) {}
+      }
     }
 
     if (state.currentMatchId !== targetMatchId) return;
@@ -906,7 +1152,7 @@ async function fetchAndRenderLoLSummary(match) {
       match,
       eventDetail,
       games,
-      activeGame,
+      targetGame,
       windowData
     );
     state.currentSummary = synthesizedSummary;
@@ -920,8 +1166,10 @@ async function fetchAndRenderLoLSummary(match) {
       );
     }
 
+    renderPeriodSelectorBar(match);
     renderPlayByPlay(match, synthesizedSummary);
     renderTechnicalStats(match, synthesizedSummary);
+    if (state.modalOpen) renderDataCenterModalContent(match);
   } catch (err) {
     if (state.currentMatchId !== targetMatchId) return;
     renderPlayByPlay(match, null);
@@ -934,31 +1182,56 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
   const awayStats = [];
   const homeStats = [];
   const leaders = [];
+  const boxscorePlayers = [];
   let blueGoldPct = match.awayWinPct;
   let redGoldPct = match.homeWinPct;
 
-  // 1. Add series game-by-game overview plays
+  const activeGameNum = activeGame ? Number(activeGame.number) : 1;
+
+  // 1. Add interactive series game cards so clicking any Game N switches directly to that game's stats!
   if (Array.isArray(games) && games.length > 0) {
     games.forEach((g) => {
-      const gNum = g.number || 1;
+      const gNum = Number(g.number) || 1;
       const gState =
         g.state === 'inProgress'
           ? '進行中 LIVE'
           : g.state === 'completed'
           ? '已完賽'
           : '未開始';
-      if (g.state !== 'unstarted') {
-        plays.push({
-          id: `game-${g.id || gNum}`,
-          clock: { displayValue: `Game ${gNum}` },
-          period: { displayValue: match.blockName || 'BO5' },
-          type: { text: `第 ${gNum} 局 (${gState})` },
-          text: `${match.away.fullName} vs ${match.home.fullName} — 第 ${gNum} 局峽谷對決 (${gState})`,
-          scoringPlay: g.state === 'inProgress',
-          awayScore: match.away.score,
-          homeScore: match.home.score,
-        });
+
+      // Map blue/red side teams for this specific game
+      let sideInfo = '';
+      if (Array.isArray(g.teams) && g.teams.length >= 2) {
+        const bTeamObj = g.teams.find((t) => t.side === 'blue');
+        const rTeamObj = g.teams.find((t) => t.side === 'red');
+        const bName =
+          bTeamObj?.id === match.away.id
+            ? match.away.abbr
+            : bTeamObj?.id === match.home.id
+            ? match.home.abbr
+            : match.away.abbr;
+        const rName = bName === match.away.abbr ? match.home.abbr : match.away.abbr;
+        sideInfo = `（藍方 ${bName} vs 紅方 ${rName}）`;
       }
+
+      plays.push({
+        id: `game-${g.id || gNum}`,
+        gameNumber: gNum,
+        isGameSelectorCard: true,
+        clock: { displayValue: `Game ${gNum}` },
+        period: { number: gNum, displayValue: match.blockName || 'BO5' },
+        type: { text: `第 ${gNum} 局 (${gState})` },
+        text: `${match.away.fullName} vs ${match.home.fullName} — 第 ${gNum} 局峽谷對決 ${sideInfo}`,
+        actionHint:
+          g.state === 'unstarted'
+            ? '此局尚未開始'
+            : activeGameNum === gNum
+            ? `✨ 目前顯示第 ${gNum} 局數據（點擊開啟完整數據中心）`
+            : `👉 點擊切換查看第 ${gNum} 局十人英雄 KDA 與詳細戰況`,
+        scoringPlay: g.state === 'inProgress' || activeGameNum === gNum,
+        awayScore: match.away.score,
+        homeScore: match.home.score,
+      });
     });
   }
 
@@ -969,7 +1242,7 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
     const blue = latestFrame.blueTeam || {};
     const red = latestFrame.redTeam || {};
     const meta = windowData.gameMetadata || {};
-    const gNumLabel = activeGame ? `G${activeGame.number}` : 'LIVE';
+    const gNumLabel = activeGame ? `Game ${activeGame.number}` : 'LIVE';
 
     const blueGold = Number(blue.totalGold || 0);
     const redGold = Number(red.totalGold || 0);
@@ -983,22 +1256,22 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
       homeStats.push({ name: label, label, displayValue: String(rVal) });
     };
 
-    pushStatPair('總擊殺 (Kills)', blue.totalKills ?? 0, red.totalKills ?? 0);
+    pushStatPair(`${gNumLabel} 總擊殺 (Kills)`, blue.totalKills ?? 0, red.totalKills ?? 0);
     pushStatPair(
-      '團隊總經濟 (Gold)',
+      `${gNumLabel} 團隊經濟 (Gold)`,
       `${(blueGold / 1000).toFixed(1)}k`,
       `${(redGold / 1000).toFixed(1)}k`
     );
-    pushStatPair('摧毀防禦塔 (Towers)', blue.towers ?? 0, red.towers ?? 0);
-    pushStatPair('巴龍擊殺 (Barons)', blue.barons ?? 0, red.barons ?? 0);
+    pushStatPair(`${gNumLabel} 摧毀防禦塔 (Towers)`, blue.towers ?? 0, red.towers ?? 0);
+    pushStatPair(`${gNumLabel} 巴龍擊殺 (Barons)`, blue.barons ?? 0, red.barons ?? 0);
     pushStatPair(
-      '元素飛龍 (Dragons)',
+      `${gNumLabel} 元素飛龍 (Dragons)`,
       Array.isArray(blue.dragons) ? blue.dragons.length : 0,
       Array.isArray(red.dragons) ? red.dragons.length : 0
     );
-    pushStatPair('水晶兵營 (Inhibitors)', blue.inhibitors ?? 0, red.inhibitors ?? 0);
+    pushStatPair(`${gNumLabel} 水晶兵營 (Inhibitors)`, blue.inhibitors ?? 0, red.inhibitors ?? 0);
 
-    // Extract frame-by-frame combat events (kills, towers, barons, dragons)
+    // Extract frame-by-frame combat events
     let prevB = null;
     let prevR = null;
     frames.forEach((f, idx) => {
@@ -1012,11 +1285,12 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
         if ((b.totalKills || 0) > (prevB.totalKills || 0)) {
           const diff = b.totalKills - prevB.totalKills;
           plays.push({
-            id: `bk-${idx}`,
+            id: `bk-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
-            period: { displayValue: gNumLabel },
-            type: { text: '⚔️ 藍方擊殺' },
-            text: `${match.away.name} 斬獲 ${diff} 顆人頭！人頭比來到 ${b.totalKills} : ${r.totalKills}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `⚔️ ${gNumLabel} 藍方擊殺` },
+            text: `${match.away.name} 斬獲 ${diff} 顆人頭！本局擊殺比 ${b.totalKills} : ${r.totalKills}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
             scoringPlay: true,
             awayScore: b.totalKills,
             homeScore: r.totalKills,
@@ -1025,11 +1299,12 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
         if ((r.totalKills || 0) > (prevR.totalKills || 0)) {
           const diff = r.totalKills - prevR.totalKills;
           plays.push({
-            id: `rk-${idx}`,
+            id: `rk-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
-            period: { displayValue: gNumLabel },
-            type: { text: '⚔️ 紅方擊殺' },
-            text: `${match.home.name} 斬獲 ${diff} 顆人頭！人頭比來到 ${b.totalKills} : ${r.totalKills}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `⚔️ ${gNumLabel} 紅方擊殺` },
+            text: `${match.home.name} 斬獲 ${diff} 顆人頭！本局擊殺比 ${b.totalKills} : ${r.totalKills}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
             scoringPlay: true,
             awayScore: b.totalKills,
             homeScore: r.totalKills,
@@ -1037,11 +1312,12 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
         }
         if ((b.barons || 0) > (prevB.barons || 0)) {
           plays.push({
-            id: `bb-${idx}`,
+            id: `bb-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
-            period: { displayValue: gNumLabel },
-            type: { text: '🐉 巴龍擊殺' },
-            text: `${match.away.name} 成功擊殺納什男爵 (Baron Nashor)！全隊獲得巴龍 Buff 加持！`,
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `🐉 ${gNumLabel} 巴龍擊殺` },
+            text: `${match.away.name} 擊殺納什男爵 (Baron Nashor)！獲得巴龍 Buff 加持！`,
             scoringPlay: true,
             awayScore: b.totalKills,
             homeScore: r.totalKills,
@@ -1049,11 +1325,12 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
         }
         if ((r.barons || 0) > (prevR.barons || 0)) {
           plays.push({
-            id: `rb-${idx}`,
+            id: `rb-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
-            period: { displayValue: gNumLabel },
-            type: { text: '🐉 巴龍擊殺' },
-            text: `${match.home.name} 成功擊殺納什男爵 (Baron Nashor)！全隊獲得巴龍 Buff 加持！`,
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `🐉 ${gNumLabel} 巴龍擊殺` },
+            text: `${match.home.name} 擊殺納什男爵 (Baron Nashor)！獲得巴龍 Buff 加持！`,
             scoringPlay: true,
             awayScore: b.totalKills,
             homeScore: r.totalKills,
@@ -1061,11 +1338,12 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
         }
         if ((b.towers || 0) > (prevB.towers || 0)) {
           plays.push({
-            id: `bt-${idx}`,
+            id: `bt-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
-            period: { displayValue: gNumLabel },
-            type: { text: '🗼 防禦塔摧毀' },
-            text: `${match.away.name} 推進成功，累計摧毀 ${b.towers} 座防禦塔。`,
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `🗼 ${gNumLabel} 防禦塔摧毀` },
+            text: `${match.away.name} 推進成功，本局累計摧毀 ${b.towers} 座防禦塔。`,
             scoringPlay: false,
             awayScore: b.totalKills,
             homeScore: r.totalKills,
@@ -1073,11 +1351,12 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
         }
         if ((r.towers || 0) > (prevR.towers || 0)) {
           plays.push({
-            id: `rt-${idx}`,
+            id: `rt-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
-            period: { displayValue: gNumLabel },
-            type: { text: '🗼 防禦塔摧毀' },
-            text: `${match.home.name} 推進成功，累計摧毀 ${r.towers} 座防禦塔。`,
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `🗼 ${gNumLabel} 防禦塔摧毀` },
+            text: `${match.home.name} 推進成功，本局累計摧毀 ${r.towers} 座防禦塔。`,
             scoringPlay: false,
             awayScore: b.totalKills,
             homeScore: r.totalKills,
@@ -1088,35 +1367,50 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
       prevR = r;
     });
 
-    // Build Champion & KDA Leaders from participantMetadata + latestFrame participants
-    const buildRosterLeaders = (teamMeta, frameParticipants, teamAbbr) => {
+    // Build 5v5 Boxscore Table & Leaders from participantMetadata + latestFrame participants
+    const buildTeamRosterData = (teamMeta, frameParticipants, teamAbbr, teamFullName, sideLabel) => {
       const pMetaList = (teamMeta && teamMeta.participantMetadata) || [];
       const pStatsList = Array.isArray(frameParticipants) ? frameParticipants : [];
       const groupLeaders = [];
+      const athletesRows = [];
 
       pMetaList.forEach((pm, i) => {
         const ps =
           pStatsList.find((x) => x.participantId === pm.participantId) || pStatsList[i] || {};
-        const champ = pm.championId || '英雄';
+        const champ = pm.championId || 'Champion';
         const role = String(pm.role || '').toUpperCase();
-        const kda = `${ps.kills ?? 0}/${ps.deaths ?? 0}/${ps.assists ?? 0}`;
-        const cs = ps.creepScore !== undefined ? `${ps.creepScore} CS` : '';
-        const goldK =
-          ps.totalGold ? `${(Number(ps.totalGold) / 1000).toFixed(1)}k` : '';
+        const kills = ps.kills ?? 0;
+        const deaths = ps.deaths ?? 0;
+        const assists = ps.assists ?? 0;
+        const kdaStr = `${kills}/${deaths}/${assists}`;
+        const kdaRatio = ((kills + assists) / Math.max(1, deaths)).toFixed(1);
+        const cs = ps.creepScore !== undefined ? String(ps.creepScore) : '0';
+        const goldK = ps.totalGold ? `${(Number(ps.totalGold) / 1000).toFixed(1)}k` : '0.0k';
+        const level = ps.level !== undefined ? `Lv.${ps.level}` : '-';
+        const champImg = pm.championId ? `${DDRAGON_CHAMPION_CDN}/${pm.championId}.png` : '';
 
         groupLeaders.push({
           displayName: `${role} · ${champ}`,
           leaders: [
             {
-              displayValue: [kda, cs, goldK].filter(Boolean).join(' · '),
+              displayValue: `${kdaStr} · ${cs} CS · ${goldK}`,
               athlete: {
                 displayName: pm.summonerName || champ,
-                headshot: pm.championId
-                  ? `${DDRAGON_CHAMPION_CDN}/${pm.championId}.png`
-                  : '',
+                headshot: champImg,
               },
             },
           ],
+        });
+
+        athletesRows.push({
+          athlete: {
+            displayName: pm.summonerName || champ,
+            shortName: pm.summonerName || champ,
+            position: { abbreviation: role },
+            headshot: champImg,
+            championName: champ,
+          },
+          stats: [champ, level, kdaStr, kdaRatio, cs, goldK],
         });
       });
 
@@ -1126,13 +1420,40 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
           leaders: groupLeaders,
         });
       }
+
+      if (athletesRows.length > 0) {
+        boxscorePlayers.push({
+          team: {
+            abbreviation: teamAbbr,
+            displayName: `${teamFullName} (${sideLabel} · ${gNumLabel})`,
+          },
+          statistics: [
+            {
+              labels: ['英雄', '等級', 'K/D/A', 'KDA比', '吃兵 CS', '個人經濟'],
+              athletes: athletesRows,
+            },
+          ],
+        });
+      }
     };
 
-    buildRosterLeaders(meta.blueTeamMetadata, blue.participants, match.away.abbr);
-    buildRosterLeaders(meta.redTeamMetadata, red.participants, match.home.abbr);
+    buildTeamRosterData(
+      meta.blueTeamMetadata,
+      blue.participants,
+      match.away.abbr,
+      match.away.fullName,
+      '藍方 Blue'
+    );
+    buildTeamRosterData(
+      meta.redTeamMetadata,
+      red.participants,
+      match.home.abbr,
+      match.home.fullName,
+      '紅方 Red'
+    );
   }
 
-  // Fallback team series stats if live window telemetry is unavailable for an older/upcoming series
+  // Fallback team series overview if detailed window telemetry is not available
   if (awayStats.length === 0) {
     awayStats.push(
       { name: 'seriesWins', label: '系列賽勝局 (Game Wins)', displayValue: match.away.score },
@@ -1145,12 +1466,14 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
   }
 
   return {
+    activeGameNumber: activeGameNum,
     plays,
     boxscore: {
       teams: [
         { homeAway: 'away', team: { abbreviation: match.away.abbr }, statistics: awayStats },
         { homeAway: 'home', team: { abbreviation: match.home.abbr }, statistics: homeStats },
       ],
+      players: boxscorePlayers,
     },
     leaders,
     blueGoldPct,
@@ -1158,16 +1481,23 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
   };
 }
 
+/* ==========================================================================
+   3C. Play-by-Play Extraction & Interactive Click-to-Inspect
+   ========================================================================== */
+
 function extractPlaysFromSummary(match, summaryData) {
   if (!summaryData) return [];
 
-  // 1. Standard US Sports (NBA, MLB, NHL, NFL) & Synthesized LoL Plays have `plays` array
   if (Array.isArray(summaryData.plays) && summaryData.plays.length > 0) {
     return summaryData.plays
-      .slice(-80)
+      .slice(-100)
       .reverse()
       .map((p) => ({
         id: String(p.id || `${p.clock?.displayValue}-${p.text}`),
+        gameNumber: p.gameNumber || null,
+        isGameSelectorCard: Boolean(p.isGameSelectorCard),
+        actionHint: p.actionHint || '',
+        periodNumber: p.period && p.period.number ? Number(p.period.number) : null,
         clock: (p.clock && p.clock.displayValue) || '',
         period: (p.period && (p.period.displayValue || `P${p.period.number}`)) || '',
         type: (p.type && p.type.text) || '',
@@ -1181,13 +1511,16 @@ function extractPlaysFromSummary(match, summaryData) {
       .filter((item) => item.text);
   }
 
-  // 2. Soccer Commentary or KeyEvents (`commentary`, `keyEvents`)
   if (Array.isArray(summaryData.commentary) && summaryData.commentary.length > 0) {
     return summaryData.commentary
       .slice(-80)
       .reverse()
       .map((c, idx) => ({
         id: String(c.sequence || idx),
+        gameNumber: null,
+        isGameSelectorCard: false,
+        actionHint: '',
+        periodNumber: null,
         clock: (c.time && c.time.displayValue) || '',
         period: 'MATCH',
         type: (c.play && c.play.type && c.play.type.text) || '',
@@ -1204,6 +1537,10 @@ function extractPlaysFromSummary(match, summaryData) {
       .reverse()
       .map((k, idx) => ({
         id: String(k.id || idx),
+        gameNumber: null,
+        isGameSelectorCard: false,
+        actionHint: '',
+        periodNumber: k.period && k.period.number ? Number(k.period.number) : null,
         clock: (k.clock && k.clock.displayValue) || '',
         period: (k.period && k.period.displayValue) || '',
         type: (k.type && k.type.text) || '關鍵事件',
@@ -1217,18 +1554,37 @@ function extractPlaysFromSummary(match, summaryData) {
   return [];
 }
 
+function getFilteredPlaysForCurrentSelection(match, summaryData) {
+  const allPlays = extractPlaysFromSummary(match, summaryData);
+
+  // Filter by selected period/game if not 'ALL' (always keep LoL game selector cards visible at top so user can switch games)
+  let periodFiltered = allPlays;
+  if (state.selectedPeriod !== 'ALL') {
+    const wantedNum = Number(state.selectedPeriod);
+    periodFiltered = allPlays.filter((p) => {
+      if (p.isGameSelectorCard) return true;
+      if (p.gameNumber !== null) return Number(p.gameNumber) === wantedNum;
+      if (p.periodNumber !== null) return Number(p.periodNumber) === wantedNum;
+      return true;
+    });
+  }
+
+  if (state.pbpFilter === 'scoring') {
+    return periodFiltered.filter(
+      (p) =>
+        p.isGameSelectorCard ||
+        p.scoringPlay ||
+        /goal|score|homers|three point|touchdown|擊殺|巴龍/i.test(p.type + ' ' + p.text)
+    );
+  }
+
+  return periodFiltered;
+}
+
 function renderPlayByPlay(match, summaryData) {
   const allPlays = extractPlaysFromSummary(match, summaryData);
-  const filtered =
-    state.pbpFilter === 'scoring'
-      ? allPlays.filter(
-          (p) =>
-            p.scoringPlay ||
-            /goal|score|homers|three point|touchdown|擊殺|巴龍/i.test(p.type + ' ' + p.text)
-        )
-      : allPlays;
+  const filtered = getFilteredPlaysForCurrentSelection(match, summaryData);
 
-  // Broadcast newest live play to chat & danmaku if not yet announced
   if (allPlays.length > 0 && match.state === 'in') {
     const newest = allPlays[0];
     const uniqueKey = `${match.id}:${newest.id}`;
@@ -1251,37 +1607,159 @@ function renderPlayByPlay(match, summaryData) {
         ? `賽事將於 ${formatFullDateTime(match.date)} 開打，開賽後將自動串流即時 Play-by-Play 戰況紀錄。`
         : match.lastPlayText
         ? `最新賽況：${escapeHtml(match.lastPlayText)}`
-        : '此賽事目前無符合篩選條件的詳細文字紀錄。';
+        : '此賽事或該節數目前無符合篩選條件的詳細文字紀錄。';
     els.pbpFeedList.innerHTML = `<div class="empty-state">${fallbackMsg}</div>`;
     return;
   }
 
+  const activeGNum = summaryData && summaryData.activeGameNumber;
+
   els.pbpFeedList.innerHTML = filtered
-    .slice(0, 50)
-    .map(
-      (p) => `
-      <div class="pbp-item ${p.scoringPlay ? 'scoring-play' : ''}">
-        <div class="pbp-time">
-          <span>${escapeHtml(p.clock || '--:--')}</span>
-          <span class="pbp-period">${escapeHtml(p.period)}</span>
+    .slice(0, 60)
+    .map((p) => {
+      const isSelectedGameCard =
+        p.isGameSelectorCard && activeGNum && Number(p.gameNumber) === Number(activeGNum);
+      const targetPeriodAttr = p.gameNumber || p.periodNumber || '';
+
+      return `
+        <div class="pbp-item clickable ${p.scoringPlay ? 'scoring-play' : ''} ${
+          isSelectedGameCard ? 'selected-game' : ''
+        }" data-pbp-period="${escapeAttr(targetPeriodAttr)}" data-is-game-card="${
+          p.isGameSelectorCard ? '1' : '0'
+        }" title="點擊查看此局/此節完整球員與比賽數據">
+          <div class="pbp-time">
+            <span>${escapeHtml(p.clock || '--:--')}</span>
+            <span class="pbp-period">${escapeHtml(p.period)}</span>
+          </div>
+          <div class="pbp-text-wrap">
+            ${p.type ? `<span class="pbp-type-badge">${escapeHtml(p.type)}</span>` : ''}
+            <p class="pbp-desc">${escapeHtml(p.text)}</p>
+            <span class="pbp-action-hint">${escapeHtml(
+              p.actionHint || '📊 點擊進入本場/本節詳細球員數據中心 →'
+            )}</span>
+          </div>
+          ${p.scoreText ? `<span class="pbp-score-pill">${escapeHtml(p.scoreText)}</span>` : '<span></span>'}
         </div>
-        <div class="pbp-text-wrap">
-          ${p.type ? `<span class="pbp-type-badge">${escapeHtml(p.type)}</span>` : ''}
-          <p class="pbp-desc">${escapeHtml(p.text)}</p>
+      `;
+    })
+    .join('');
+
+  els.pbpFeedList.querySelectorAll('.pbp-item.clickable').forEach((item) => {
+    item.addEventListener('click', async () => {
+      const pVal = item.getAttribute('data-pbp-period');
+      const isGameCard = item.getAttribute('data-is-game-card') === '1';
+      if (pVal) {
+        await selectPeriodOrGame(pVal, false);
+      }
+      // Always switch right panel to Player Boxscore or open Deep-Dive Modal so user immediately sees the game's data
+      if (!isGameCard || String(state.selectedPeriod) === String(pVal)) {
+        openDataCenterModal();
+      }
+    });
+  });
+}
+
+/* ==========================================================================
+   3D. Technical Stats, Full Player Boxscore & Leaders Rendering
+   ========================================================================== */
+
+function buildPlayerBoxscoreHTML(match, summaryData) {
+  const playersGroups = summaryData?.boxscore?.players;
+  if (!Array.isArray(playersGroups) || playersGroups.length === 0) {
+    return '';
+  }
+
+  return playersGroups
+    .map((teamBlock, idx) => {
+      const teamObj = teamBlock.team || {};
+      const teamTitle =
+        teamObj.displayName || teamObj.name || (idx === 0 ? match.away.fullName : match.home.fullName);
+      const statBlocks = Array.isArray(teamBlock.statistics) ? teamBlock.statistics : [];
+      if (statBlocks.length === 0) return '';
+
+      const tablesHtml = statBlocks
+        .map((sb) => {
+          const labels = Array.isArray(sb.labels)
+            ? sb.labels
+            : Array.isArray(sb.names)
+            ? sb.names
+            : [];
+          const athletes = Array.isArray(sb.athletes) ? sb.athletes : [];
+          if (athletes.length === 0) return '';
+
+          // Limit columns to keep table readable while showing key metrics
+          const maxCols = Math.min(labels.length, 10);
+          const slicedLabels = labels.slice(0, maxCols);
+
+          const groupTypeTitle = sb.name || sb.type || sb.text || '';
+
+          return `
+            <div class="boxscore-table-wrap">
+              <table class="boxscore-table">
+                <thead>
+                  <tr>
+                    <th class="player-col">${escapeHtml(
+                      match.isEsports ? '選手 (路線)' : groupTypeTitle ? `球員 (${groupTypeTitle})` : '球員'
+                    )}</th>
+                    ${slicedLabels.map((lbl) => `<th>${escapeHtml(lbl)}</th>`).join('')}
+                  </tr>
+                </thead>
+                <tbody>
+                  ${athletes
+                    .slice(0, 15)
+                    .map((row) => {
+                      const ath = row.athlete || {};
+                      const pName = ath.shortName || ath.displayName || '球員';
+                      const pos = (ath.position && ath.position.abbreviation) || '';
+                      const statsArr = Array.isArray(row.stats) ? row.stats.slice(0, maxCols) : [];
+                      const imgUrl =
+                        typeof ath.headshot === 'string'
+                          ? ath.headshot
+                          : ath.headshot && ath.headshot.href
+                          ? ath.headshot.href
+                          : '';
+
+                      return `
+                        <tr>
+                          <td class="player-col">
+                            <div class="boxscore-player-cell">
+                              ${
+                                imgUrl
+                                  ? `<img src="${escapeAttr(imgUrl)}" alt="" class="boxscore-champ-icon" loading="lazy" />`
+                                  : ''
+                              }
+                              <span>${escapeHtml(pName)}</span>
+                              ${pos ? `<span class="boxscore-role-tag">${escapeHtml(pos)}</span>` : ''}
+                            </div>
+                          </td>
+                          ${statsArr.map((st) => `<td>${escapeHtml(String(st ?? '-'))}</td>`).join('')}
+                        </tr>
+                      `;
+                    })
+                    .join('')}
+                </tbody>
+              </table>
+            </div>
+          `;
+        })
+        .join('');
+
+      if (!tablesHtml) return '';
+
+      return `
+        <div class="boxscore-team-section">
+          <div class="boxscore-team-header ${idx > 0 ? 'home-header' : ''}">
+            <span>${escapeHtml(teamTitle)}</span>
+            <span>${idx === 0 ? escapeHtml(match.away.abbr) : escapeHtml(match.home.abbr)}</span>
+          </div>
+          ${tablesHtml}
         </div>
-        ${p.scoreText ? `<span class="pbp-score-pill">${escapeHtml(p.scoreText)}</span>` : '<span></span>'}
-      </div>
-    `
-    )
+      `;
+    })
     .join('');
 }
 
-function renderTechnicalStats(match, summaryData) {
-  if (state.statView === 'leaders') {
-    renderMatchLeaders(match, summaryData);
-    return;
-  }
-
+function buildTeamComparisonHTML(match, summaryData) {
   let awayStats = [];
   let homeStats = [];
 
@@ -1305,10 +1783,7 @@ function renderTechnicalStats(match, summaryData) {
     homeStats = match.home.statistics;
   }
 
-  if (awayStats.length === 0 || homeStats.length === 0) {
-    renderMatchLeaders(match, summaryData);
-    return;
-  }
+  if (awayStats.length === 0 || homeStats.length === 0) return '';
 
   const homeMap = new Map();
   homeStats.forEach((s) => {
@@ -1335,13 +1810,10 @@ function renderTechnicalStats(match, summaryData) {
     rows.push({ label, aDisp, hDisp, aPct, hPct });
   });
 
-  if (rows.length === 0) {
-    renderMatchLeaders(match, summaryData);
-    return;
-  }
+  if (rows.length === 0) return '';
 
-  els.statsContentArea.innerHTML = rows
-    .slice(0, 12)
+  return rows
+    .slice(0, 14)
     .map(
       (r) => `
       <div class="stat-comparison-row">
@@ -1360,7 +1832,7 @@ function renderTechnicalStats(match, summaryData) {
     .join('');
 }
 
-function renderMatchLeaders(match, summaryData) {
+function buildLeadersHTML(match, summaryData) {
   const leaderItems = [];
 
   const collectFromGroup = (groups, teamAbbr) => {
@@ -1393,12 +1865,9 @@ function renderMatchLeaders(match, summaryData) {
     collectFromGroup(match.compLeaders, '');
   }
 
-  if (leaderItems.length === 0) {
-    els.statsContentArea.innerHTML = `<div class="empty-state">本場賽事將於開賽後更新選手英雄 KDA 與團隊技術統計。</div>`;
-    return;
-  }
+  if (leaderItems.length === 0) return '';
 
-  els.statsContentArea.innerHTML = leaderItems
+  return leaderItems
     .slice(0, 10)
     .map(
       (item) => `
@@ -1421,6 +1890,42 @@ function renderMatchLeaders(match, summaryData) {
     .join('');
 }
 
+function renderTechnicalStats(match, summaryData) {
+  const boxscoreHtml = buildPlayerBoxscoreHTML(match, summaryData);
+  const teamHtml = buildTeamComparisonHTML(match, summaryData);
+  const leadersHtml = buildLeadersHTML(match, summaryData);
+
+  if (state.statView === 'boxscore') {
+    if (boxscoreHtml) {
+      els.statsContentArea.innerHTML = boxscoreHtml;
+      return;
+    }
+    if (teamHtml) {
+      els.statsContentArea.innerHTML = teamHtml;
+      return;
+    }
+  }
+
+  if (state.statView === 'team') {
+    if (teamHtml) {
+      els.statsContentArea.innerHTML = teamHtml;
+      return;
+    }
+  }
+
+  if (leadersHtml) {
+    els.statsContentArea.innerHTML = leadersHtml;
+    return;
+  }
+
+  if (teamHtml) {
+    els.statsContentArea.innerHTML = teamHtml;
+    return;
+  }
+
+  els.statsContentArea.innerHTML = `<div class="empty-state">本場賽事將於開賽後即時更新完整球員/選手盒式數據 (Boxscore) 與團隊技術指標。</div>`;
+}
+
 function parseStatNumber(str) {
   const cleaned = String(str).replace('%', '').replace(/k$/i, '').trim();
   if (cleaned.includes('-')) {
@@ -1429,6 +1934,105 @@ function parseStatNumber(str) {
   }
   const num = parseFloat(cleaned);
   return Number.isFinite(num) ? Math.abs(num) : 0;
+}
+
+/* ==========================================================================
+   3E. Deep-Dive Match Data Center Modal
+   ========================================================================== */
+
+function openDataCenterModal() {
+  const match = state.filteredMatches[state.currentMatchIndex];
+  if (!match || !els.datacenterModal) return;
+
+  // Pause carousel while modal is open
+  if (state.autoRotate) {
+    state.autoRotate = false;
+    els.btnToggleRotate.classList.remove('active');
+    els.rotateIcon.innerHTML = '&#9654;';
+    updateRotationProgressUI();
+  }
+
+  state.modalOpen = true;
+  els.datacenterModal.hidden = false;
+  renderPeriodSelectorBar(match);
+  renderDataCenterModalContent(match);
+}
+
+function closeDataCenterModal() {
+  state.modalOpen = false;
+  if (els.datacenterModal) {
+    els.datacenterModal.hidden = true;
+  }
+}
+
+function renderDataCenterModalContent(match) {
+  if (!match || !els.datacenterModalBody) return;
+  const summaryData = state.currentSummary;
+
+  els.modalLeaguePill.textContent = match.leagueLabel;
+  els.modalMatchTitle.textContent = `${match.away.fullName} (${match.away.score}) vs (${match.home.score}) ${match.home.fullName}`;
+  els.modalMatchSubtitle.textContent = formatSituationText(match);
+
+  const boxscoreHtml =
+    buildPlayerBoxscoreHTML(match, summaryData) ||
+    buildLeadersHTML(match, summaryData) ||
+    '<div class="empty-state">目前尚無詳細球員/選手盒式數據。</div>';
+
+  const teamStatsHtml =
+    buildTeamComparisonHTML(match, summaryData) ||
+    '<div class="empty-state">目前尚無團隊對比數據。</div>';
+
+  const filteredPlays = getFilteredPlaysForCurrentSelection(match, summaryData).slice(0, 35);
+  const playsHtml =
+    filteredPlays.length > 0
+      ? filteredPlays
+          .map(
+            (p) => `
+          <div class="pbp-item ${p.scoringPlay ? 'scoring-play' : ''}">
+            <div class="pbp-time">
+              <span>${escapeHtml(p.clock || '--:--')}</span>
+              <span class="pbp-period">${escapeHtml(p.period)}</span>
+            </div>
+            <div class="pbp-text-wrap">
+              ${p.type ? `<span class="pbp-type-badge">${escapeHtml(p.type)}</span>` : ''}
+              <p class="pbp-desc">${escapeHtml(p.text)}</p>
+            </div>
+            ${p.scoreText ? `<span class="pbp-score-pill">${escapeHtml(p.scoreText)}</span>` : '<span></span>'}
+          </div>
+        `
+          )
+          .join('')
+      : '<div class="empty-state">無符合此局/節數的詳細文字紀錄。</div>';
+
+  els.datacenterModalBody.innerHTML = `
+    <div class="modal-section-card">
+      <div class="modal-section-title">
+        <span>📋 球員 / 選手個人數據表 (Player Boxscore)</span>
+        <span>${state.selectedPeriod === 'ALL' ? '全場統計' : `局/節數: ${state.selectedPeriod}`}</span>
+      </div>
+      <div>${boxscoreHtml}</div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:18px;">
+      <div class="modal-section-card">
+        <div class="modal-section-title">
+          <span>📊 團隊關鍵數據對比 (Team Comparison)</span>
+          <span>${escapeHtml(match.away.abbr)} vs ${escapeHtml(match.home.abbr)}</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px;">${teamStatsHtml}</div>
+      </div>
+
+      <div class="modal-section-card">
+        <div class="modal-section-title">
+          <span>⚡ 該局 / 該節關鍵戰況紀錄 (Play-by-Play)</span>
+          <span>共 ${filteredPlays.length} 筆</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;max-height:360px;overflow-y:auto;">
+          ${playsHtml}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 /* ==========================================================================
@@ -1580,7 +2184,7 @@ function updateRotationProgressUI() {
   const remainSec = Math.max(0, Math.ceil((totalMs - state.rotateElapsedMs) / 1000));
   const pct = Math.min(100, (state.rotateElapsedMs / totalMs) * 100);
 
-  els.rotationCountdown.textContent = state.autoRotate ? `${remainSec}s` : '已暫停';
+  els.rotationCountdown.textContent = state.autoRotate ? `${remainSec}s` : '已鎖定單場';
   els.rotationProgressBar.style.width = `${pct}%`;
 }
 
@@ -1643,6 +2247,19 @@ function bindEvents() {
     syncAllScoreboards(true);
   });
 
+  // Open / Close Deep-Dive Data Center Modal
+  if (els.btnOpenDatacenter) {
+    els.btnOpenDatacenter.addEventListener('click', openDataCenterModal);
+  }
+  if (els.btnCloseDatacenter) {
+    els.btnCloseDatacenter.addEventListener('click', closeDataCenterModal);
+  }
+  if (els.datacenterModal) {
+    els.datacenterModal.addEventListener('click', (e) => {
+      if (e.target === els.datacenterModal) closeDataCenterModal();
+    });
+  }
+
   els.pbpFilterAll.addEventListener('click', () => {
     state.pbpFilter = 'all';
     els.pbpFilterAll.classList.add('active');
@@ -1659,21 +2276,22 @@ function bindEvents() {
     if (match) renderPlayByPlay(match, state.currentSummary);
   });
 
-  els.statTabTeam.addEventListener('click', () => {
-    state.statView = 'team';
-    els.statTabTeam.classList.add('active');
-    els.statTabLeaders.classList.remove('active');
+  const setStatTab = (viewName) => {
+    state.statView = viewName;
+    if (els.statTabBoxscore) {
+      els.statTabBoxscore.classList.toggle('active', viewName === 'boxscore');
+    }
+    els.statTabTeam.classList.toggle('active', viewName === 'team');
+    els.statTabLeaders.classList.toggle('active', viewName === 'leaders');
     const match = state.filteredMatches[state.currentMatchIndex];
     if (match) renderTechnicalStats(match, state.currentSummary);
-  });
+  };
 
-  els.statTabLeaders.addEventListener('click', () => {
-    state.statView = 'leaders';
-    els.statTabLeaders.classList.add('active');
-    els.statTabTeam.classList.remove('active');
-    const match = state.filteredMatches[state.currentMatchIndex];
-    if (match) renderTechnicalStats(match, state.currentSummary);
-  });
+  if (els.statTabBoxscore) {
+    els.statTabBoxscore.addEventListener('click', () => setStatTab('boxscore'));
+  }
+  els.statTabTeam.addEventListener('click', () => setStatTab('team'));
+  els.statTabLeaders.addEventListener('click', () => setStatTab('leaders'));
 
   els.btnVoteAway.addEventListener('click', () => handleVote('away'));
   els.btnVoteHome.addEventListener('click', () => handleVote('home'));
