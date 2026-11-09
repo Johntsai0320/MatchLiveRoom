@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MatchLiveRoom — 24H 全球運動賽事即時直播間</title>
+  <meta name="description" content="零成本、純前端、24 小時自動輪播的全球運動與電競賽事即時直播間。直接串接 ESPN 公開 API 與 Riot LoL Esports 官方 API，即時呈現 LOL 世界大賽、LCK、LPL、NBA、MLB、英超、西甲、歐冠比分看板、Play-by-Play 文字轉播、技術統計與球迷互動區。" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Top Broadcast Header -->
+  <header class="broadcast-header" id="broadcast-header">
+    <div class="header-left">
+      <div class="brand-logo" id="brand-logo">
+        <span class="live-beacon" id="global-live-beacon"></span>
+        <div class="brand-titles">
+          <h1 class="brand-name">MATCH<span>LIVE</span>ROOM</h1>
+          <span class="brand-subtitle">24/7 GLOBAL SPORTS &amp; ESPORTS DESK</span>
+        </div>
+      </div>
+
+      <div class="api-status-pill" id="api-status-pill" title="ESPN + LoL Esports API 純前端直連狀態">
+        <span class="status-dot" id="api-status-dot"></span>
+        <span id="api-status-text">全球 API 連線中...</span>
+      </div>
+    </div>
+
+    <!-- League Filter Navigation -->
+    <nav class="league-nav" id="league-nav" aria-label="聯賽篩選">
+      <button class="league-tab active" data-league="ALL" id="tab-all">
+        全球輪播 <span class="tab-count" id="count-ALL">0</span>
+      </button>
+      <button class="league-tab live-filter" data-league="LIVE" id="tab-live">
+        LIVE 進行中 <span class="tab-count" id="count-LIVE">0</span>
+      </button>
+      <button class="league-tab esports-tab" data-league="lol-worlds" id="tab-lol-worlds">
+        🏆 LOL 世界賽 <span class="tab-count" id="count-lol-worlds">0</span>
+      </button>
+      <button class="league-tab esports-tab" data-league="lol-pro" id="tab-lol-pro">
+        🎮 LOL 職業聯賽 <span class="tab-count" id="count-lol-pro">0</span>
+      </button>
+      <button class="league-tab" data-league="nba" id="tab-nba">
+        NBA <span class="tab-count" id="count-nba">0</span>
+      </button>
+      <button class="league-tab" data-league="mlb" id="tab-mlb">
+        MLB <span class="tab-count" id="count-mlb">0</span>
+      </button>
+      <button class="league-tab" data-league="epl" id="tab-epl">
+        英超 <span class="tab-count" id="count-epl">0</span>
+      </button>
+      <button class="league-tab" data-league="laliga" id="tab-laliga">
+        西甲 <span class="tab-count" id="count-laliga">0</span>
+      </button>
+      <button class="league-tab" data-league="ucl" id="tab-ucl">
+        歐冠 <span class="tab-count" id="count-ucl">0</span>
+      </button>
+      <button class="league-tab" data-league="nhl" id="tab-nhl">
+        NHL <span class="tab-count" id="count-nhl">0</span>
+      </button>
+      <button class="league-tab" data-league="nfl" id="tab-nfl">
+        NFL <span class="tab-count" id="count-nfl">0</span>
+      </button>
+    </nav>
+
+    <!-- 24H Auto-Carousel Controls -->
+    <div class="carousel-controls" id="carousel-controls">
+      <div class="rotation-status">
+        <div class="rotation-label-row">
+          <span class="rotation-title">24H 自動輪播</span>
+          <span class="rotation-countdown" id="rotation-countdown">25s</span>
+        </div>
+        <div class="rotation-progress-track">
+          <div class="rotation-progress-bar" id="rotation-progress-bar"></div>
+        </div>
+      </div>
+
+      <div class="control-btn-group">
+        <button class="ctrl-btn" id="btn-prev-match" title="上一場賽事" aria-label="上一場賽事">
+          &#9664;
+        </button>
+        <button class="ctrl-btn active" id="btn-toggle-rotate" title="暫停/啟動自動輪播" aria-label="暫停或啟動自動輪播">
+          <span id="rotate-icon">&#10074;&#10074;</span>
+        </button>
+        <button class="ctrl-btn" id="btn-next-match" title="下一場賽事" aria-label="下一場賽事">
+          &#9654;
+        </button>
+        <select class="interval-select" id="select-interval" title="輪播切換秒數" aria-label="輪播切換秒數">
+          <option value="15">15 秒</option>
+          <option value="25" selected>25 秒</option>
+          <option value="45">45 秒</option>
+          <option value="60">60 秒</option>
+        </select>
+        <button class="ctrl-btn" id="btn-refresh-now" title="立即重新同步 ESPN API" aria-label="立即重新同步">
+          &#8635;
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- 24/7 Global Match Ticker Strip -->
+  <section class="ticker-strip-container" aria-label="全球賽事即時佇列">
+    <div class="ticker-strip" id="match-ticker-strip">
+      <div class="ticker-skeleton">正在從全球 ESPN 節點載入即時賽事佇列...</div>
+    </div>
+  </section>
+
+  <!-- Main Broadcast Live Room Layout -->
+  <main class="live-room-grid" id="live-room-grid">
+    <!-- Left / Center Main Stage: Scoreboard Jumbotron + Play-by-Play + Technical Stats -->
+    <div class="stage-column">
+      <!-- Jumbotron Scoreboard Card -->
+      <section class="jumbotron-card" id="jumbotron-card" aria-label="即時比分看板">
+        <!-- Floating Danmaku Overlay Container -->
+        <div class="danmaku-layer" id="danmaku-layer" aria-hidden="true"></div>
+
+        <!-- Match Meta Top Bar -->
+        <div class="jumbotron-topbar">
+          <div class="match-league-badge" id="match-league-badge">
+            <span class="league-pill" id="current-league-pill">LOADING</span>
+            <span class="match-venue-text" id="current-venue-text">正在連線至賽場轉播台...</span>
+          </div>
+          <div class="match-status-cluster">
+            <span class="match-state-badge" id="current-state-badge">SYNCING</span>
+            <span class="match-clock-text" id="current-clock-text">--:--</span>
+          </div>
+        </div>
+
+        <!-- Main Teams & Scoreboard Row -->
+        <div class="jumbotron-main-board">
+          <!-- Away / First Competitor (or Home depending on sport convention, clearly labeled) -->
+          <div class="team-block away-block" id="team-block-away">
+            <div class="team-logo-wrap">
+              <img id="away-team-logo" src="" alt="" class="team-logo" hidden />
+              <div id="away-team-fallback" class="team-logo-fallback">AWY</div>
+            </div>
+            <div class="team-identity">
+              <div class="team-Tagline">
+                <span class="home-away-tag" id="away-role-tag">客隊 AWAY</span>
+                <span class="team-record" id="away-team-record"></span>
+              </div>
+              <h2 class="team-name" id="away-team-name">載入中...</h2>
+              <div class="team-abbr" id="away-team-abbr">---</div>
+            </div>
+          </div>
+
+          <!-- Center Score & Match Situation -->
+          <div class="score-center-block">
+            <div class="score-digits-row">
+              <span class="score-digit" id="away-score-digit">-</span>
+              <span class="score-divider">:</span>
+              <span class="score-digit" id="home-score-digit">-</span>
+            </div>
+            <div class="match-situation-pill" id="match-situation-pill">
+              等待 ESPN 即時數據流...
+            </div>
+            <div class="last-play-banner" id="last-play-banner">
+              系統正在聚合跨時區聯賽即時賽況
+            </div>
+          </div>
+
+          <!-- Home Competitor -->
+          <div class="team-block home-block" id="team-block-home">
+            <div class="team-identity align-right">
+              <div class="team-Tagline justify-end">
+                <span class="team-record" id="home-team-record"></span>
+                <span class="home-away-tag" id="home-role-tag">主隊 HOME</span>
+              </div>
+              <h2 class="team-name" id="home-team-name">載入中...</h2>
+              <div class="team-abbr" id="home-team-abbr">---</div>
+            </div>
+            <div class="team-logo-wrap">
+              <img id="home-team-logo" src="" alt="" class="team-logo" hidden />
+              <div id="home-team-fallback" class="team-logo-fallback">HOM</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Period / Inning / Half Line-Score Table & Win Probability Bar -->
+        <div class="jumbotron-footer">
+          <div class="linescore-wrapper" id="linescore-wrapper">
+            <!-- Dynamically populated table -->
+          </div>
+          <div class="momentum-bar-wrap" id="momentum-bar-wrap">
+            <div class="momentum-labels">
+              <span id="momentum-away-label">客隊氣勢 50%</span>
+              <span class="momentum-title">即時戰況優勢指標</span>
+              <span id="momentum-home-label">主隊氣勢 50%</span>
+            </div>
+            <div class="momentum-track">
+              <div class="momentum-fill-away" id="momentum-fill-away" style="width: 50%"></div>
+              <div class="momentum-fill-home" id="momentum-fill-home" style="width: 50%"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Lower Split Panel: Play-by-Play Live Feed & Technical Statistics -->
+      <div class="lower-stage-grid">
+        <!-- Play-by-Play Live Text Feed -->
+        <section class="panel-card pbp-panel" aria-label="現場文字動態 Play-by-Play">
+          <div class="panel-header">
+            <div class="panel-title-group">
+              <span class="panel-indicator"></span>
+              <h3 class="panel-title">現場文字動態 <small>PLAY-BY-PLAY</small></h3>
+            </div>
+            <div class="pbp-filter-group">
+              <button class="sub-tab active" data-pbp="all" id="pbp-filter-all">全部動態</button>
+              <button class="sub-tab" data-pbp="scoring" id="pbp-filter-scoring">關鍵/得分</button>
+            </div>
+          </div>
+
+          <div class="pbp-feed-list" id="pbp-feed-list">
+            <div class="empty-state">正在向 ESPN Summary API 請求即時 Play-by-Play 紀錄...</div>
+          </div>
+        </section>
+
+        <!-- Technical Stats & Leaders Panel -->
+        <section class="panel-card stats-panel" aria-label="技術統計與數據領先者">
+          <div class="panel-header">
+            <div class="panel-title-group">
+              <span class="panel-indicator amber"></span>
+              <h3 class="panel-title">技術統計與焦點球員 <small>BOXSCORE &amp; LEADERS</small></h3>
+            </div>
+            <div class="stats-view-group">
+              <button class="sub-tab active" data-statview="team" id="stat-tab-team">團隊數據</button>
+              <button class="sub-tab" data-statview="leaders" id="stat-tab-leaders">表現焦點</button>
+            </div>
+          </div>
+
+          <div class="stats-content-area" id="stats-content-area">
+            <div class="empty-state">正在載入本場技術統計指標...</div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- Right Column: Live Room Interactive Fan Zone (Poll, Reactions, Live Chat & Broadcast Log) -->
+    <aside class="interactive-sidebar" aria-label="直播間球迷互動區">
+      <!-- Real-Time Crowd Prediction Poll -->
+      <section class="panel-card poll-card">
+        <div class="panel-header compact">
+          <div class="panel-title-group">
+            <span class="panel-indicator emerald"></span>
+            <h3 class="panel-title">直播間勝負預測 <small>FAN PREDICTION</small></h3>
+          </div>
+          <span class="total-votes-badge" id="poll-total-votes">0 票</span>
+        </div>
+
+        <div class="poll-body">
+          <div class="poll-buttons-row">
+            <button class="poll-vote-btn away-vote" id="btn-vote-away">
+              <span class="vote-team-name" id="vote-away-name">客隊勝</span>
+              <span class="vote-pct" id="vote-away-pct">50%</span>
+            </button>
+            <button class="poll-vote-btn draw-vote" id="btn-vote-draw" hidden>
+              <span class="vote-team-name">和局</span>
+              <span class="vote-pct" id="vote-draw-pct">0%</span>
+            </button>
+            <button class="poll-vote-btn home-vote" id="btn-vote-home">
+              <span class="vote-team-name" id="vote-home-name">主隊勝</span>
+              <span class="vote-pct" id="vote-home-pct">50%</span>
+            </button>
+          </div>
+          <div class="poll-bar-track">
+            <div class="poll-bar-away" id="poll-bar-away" style="width: 50%"></div>
+            <div class="poll-bar-home" id="poll-bar-home" style="width: 50%"></div>
+          </div>
+          <div class="quick-cheer-row">
+            <span class="cheer-label">一鍵應援彈幕：</span>
+            <button class="cheer-chip" data-cheer="🔥 這波操作太神啦！">🔥 神級操作</button>
+            <button class="cheer-chip" data-cheer="🐉 巴龍團戰拉滿！">🐉 巴龍決戰</button>
+            <button class="cheer-chip" data-cheer="🛡️ 防守強度拉滿！">🛡️ 鐵血防守</button>
+            <button class="cheer-chip" data-cheer="⚡ 節奏太快了！">⚡ 節奏起飛</button>
+            <button class="cheer-chip" data-cheer="🏆 讓二追三傳奇！">🏆 讓二追三</button>
+            <button class="cheer-chip" data-cheer="📣 全場沸騰！">📣 全場沸騰</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Live Room Chat & Automated Play Broadcast Stream -->
+      <section class="panel-card chat-card">
+        <div class="panel-header compact">
+          <div class="panel-title-group">
+            <span class="panel-indicator"></span>
+            <h3 class="panel-title">即時聊天室 <small>LIVE CHAT</small></h3>
+          </div>
+          <label class="danmaku-toggle-label" title="在主記分板顯示浮動彈幕">
+            <input type="checkbox" id="toggle-danmaku" checked />
+            <span>彈幕</span>
+          </label>
+        </div>
+
+        <div class="chat-messages-list" id="chat-messages-list">
+          <!-- Populated dynamically with real match play alerts + user messages -->
+        </div>
+
+        <form class="chat-input-form" id="chat-input-form">
+          <input
+            type="text"
+            class="chat-nickname-input"
+            id="chat-nickname-input"
+            placeholder="暱稱"
+            maxlength="12"
+            value="觀眾"
+            aria-label="聊天室暱稱"
+          />
+          <input
+            type="text"
+            class="chat-text-input"
+            id="chat-text-input"
+            placeholder="輸入賽況討論或發送彈幕..."
+            maxlength="120"
+            autocomplete="off"
+            aria-label="訊息內容"
+          />
+          <button type="submit" class="chat-send-btn" id="chat-send-btn">發送</button>
+        </form>
+      </section>
+
+      <!-- Global Broadcast Schedule / Telemetry Status Footer Card -->
+      <section class="panel-card telemetry-card">
+        <div class="telemetry-row">
+          <span class="telemetry-key">資料來源</span>
+          <span class="telemetry-val">ESPN API + Riot LoL Esports API (純前端直連)</span>
+        </div>
+        <div class="telemetry-row">
+          <span class="telemetry-key">全球賽事池</span>
+          <span class="telemetry-val" id="telemetry-pool-summary">載入中...</span>
+        </div>
+        <div class="telemetry-row">
+          <span class="telemetry-key">上次同步時間</span>
+          <span class="telemetry-val" id="telemetry-last-sync">--:--:--</span>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
