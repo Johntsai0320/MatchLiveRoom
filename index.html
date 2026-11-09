@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MatchLiveRoom — 24H 全球運動賽事即時直播間</title>
-  <meta name="description" content="零成本、純前端、24 小時自動輪播的全球運動與電競賽事即時直播間。直接串接 ESPN 公開 API 與 Riot LoL Esports 官方 API，即時呈現 LOL 世界大賽、LCK、LPL、NBA、MLB、英超、西甲、歐冠比分看板、Play-by-Play 文字轉播、技術統計與球迷互動區。" />
+  <title>MatchLiveRoom — 24H 全球運動與電競賽事即時直播間</title>
+  <meta name="description" content="零成本、純前端、24 小時自動輪播的全球運動與電競賽事即時直播間。直接串接 ESPN 公開 API 與 Riot LoL Esports 官方 API，即時呈現 LOL 世界大賽、LCK、LPL、NBA、MLB、英超、西甲、歐冠比分看板、Play-by-Play 文字轉播、完整球員/選手 Boxscore 數據與球迷互動區。" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet" />
@@ -93,7 +93,7 @@
           <option value="45">45 秒</option>
           <option value="60">60 秒</option>
         </select>
-        <button class="ctrl-btn" id="btn-refresh-now" title="立即重新同步 ESPN API" aria-label="立即重新同步">
+        <button class="ctrl-btn" id="btn-refresh-now" title="立即重新同步 API" aria-label="立即重新同步">
           &#8635;
         </button>
       </div>
@@ -103,7 +103,7 @@
   <!-- 24/7 Global Match Ticker Strip -->
   <section class="ticker-strip-container" aria-label="全球賽事即時佇列">
     <div class="ticker-strip" id="match-ticker-strip">
-      <div class="ticker-skeleton">正在從全球 ESPN 節點載入即時賽事佇列...</div>
+      <div class="ticker-skeleton">正在從全球 ESPN 與 LoL Esports 節點載入即時賽事佇列...</div>
     </div>
   </section>
 
@@ -125,12 +125,15 @@
           <div class="match-status-cluster">
             <span class="match-state-badge" id="current-state-badge">SYNCING</span>
             <span class="match-clock-text" id="current-clock-text">--:--</span>
+            <button class="open-datacenter-btn" id="btn-open-datacenter" type="button">
+              📊 查看本場完整數據
+            </button>
           </div>
         </div>
 
         <!-- Main Teams & Scoreboard Row -->
         <div class="jumbotron-main-board">
-          <!-- Away / First Competitor (or Home depending on sport convention, clearly labeled) -->
+          <!-- Away / Blue Side Competitor -->
           <div class="team-block away-block" id="team-block-away">
             <div class="team-logo-wrap">
               <img id="away-team-logo" src="" alt="" class="team-logo" hidden />
@@ -154,14 +157,14 @@
               <span class="score-digit" id="home-score-digit">-</span>
             </div>
             <div class="match-situation-pill" id="match-situation-pill">
-              等待 ESPN 即時數據流...
+              等待即時數據流...
             </div>
             <div class="last-play-banner" id="last-play-banner">
               系統正在聚合跨時區聯賽即時賽況
             </div>
           </div>
 
-          <!-- Home Competitor -->
+          <!-- Home / Red Side Competitor -->
           <div class="team-block home-block" id="team-block-home">
             <div class="team-identity align-right">
               <div class="team-Tagline justify-end">
@@ -178,9 +181,14 @@
           </div>
         </div>
 
+        <!-- Interactive Game / Period / Inning Selector Strip -->
+        <div class="game-period-bar" id="game-period-bar" aria-label="單局或節數切換">
+          <!-- Dynamically populated buttons for Game 1~5 or Period/Quarter/Inning selection -->
+        </div>
+
         <!-- Period / Inning / Half Line-Score Table & Win Probability Bar -->
         <div class="jumbotron-footer">
-          <div class="linescore-wrapper" id="linescore-wrapper">
+          <div class="linescore-wrapper" id="linescore-wrapper" title="點擊任一局數或節數可切換查看該局詳細數據">
             <!-- Dynamically populated table -->
           </div>
           <div class="momentum-bar-wrap" id="momentum-bar-wrap">
@@ -204,7 +212,9 @@
           <div class="panel-header">
             <div class="panel-title-group">
               <span class="panel-indicator"></span>
-              <h3 class="panel-title">現場文字動態 <small>PLAY-BY-PLAY</small></h3>
+              <h3 class="panel-title">
+                現場文字動態 <small id="pbp-subtitle-tag">PLAY-BY-PLAY (點擊項目查看詳細數據)</small>
+              </h3>
             </div>
             <div class="pbp-filter-group">
               <button class="sub-tab active" data-pbp="all" id="pbp-filter-all">全部動態</button>
@@ -213,19 +223,20 @@
           </div>
 
           <div class="pbp-feed-list" id="pbp-feed-list">
-            <div class="empty-state">正在向 ESPN Summary API 請求即時 Play-by-Play 紀錄...</div>
+            <div class="empty-state">正在請求即時 Play-by-Play 紀錄...</div>
           </div>
         </section>
 
-        <!-- Technical Stats & Leaders Panel -->
-        <section class="panel-card stats-panel" aria-label="技術統計與數據領先者">
+        <!-- Technical Stats, Player Boxscore & Leaders Panel -->
+        <section class="panel-card stats-panel" aria-label="技術統計與球員選手數據">
           <div class="panel-header">
             <div class="panel-title-group">
               <span class="panel-indicator amber"></span>
-              <h3 class="panel-title">技術統計與焦點球員 <small>BOXSCORE &amp; LEADERS</small></h3>
+              <h3 class="panel-title">技術統計與選手數據 <small id="stats-subtitle-tag">BOXSCORE &amp; STATS</small></h3>
             </div>
             <div class="stats-view-group">
-              <button class="sub-tab active" data-statview="team" id="stat-tab-team">團隊數據</button>
+              <button class="sub-tab active" data-statview="boxscore" id="stat-tab-boxscore">球員/選手數據</button>
+              <button class="sub-tab" data-statview="team" id="stat-tab-team">團隊對比</button>
               <button class="sub-tab" data-statview="leaders" id="stat-tab-leaders">表現焦點</button>
             </div>
           </div>
@@ -337,6 +348,30 @@
       </section>
     </aside>
   </main>
+
+  <!-- Deep-Dive Match Data Center Modal (Opens when clicking a match's data button or specific game/play) -->
+  <div class="datacenter-modal-backdrop" id="datacenter-modal" hidden>
+    <div class="datacenter-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modal-match-title">
+      <div class="datacenter-modal-header">
+        <div class="modal-title-wrap">
+          <span class="league-pill" id="modal-league-pill">MATCH DATA</span>
+          <h2 class="modal-match-title" id="modal-match-title">賽事完整數據中心</h2>
+          <span class="modal-match-subtitle" id="modal-match-subtitle"></span>
+        </div>
+        <button class="modal-close-btn" id="btn-close-datacenter" type="button" aria-label="關閉數據視窗">
+          &#10005; 關閉
+        </button>
+      </div>
+
+      <!-- Modal Game / Period Selector -->
+      <div class="modal-period-bar" id="modal-period-bar"></div>
+
+      <!-- Modal Content Grid: Full Player Boxscore + Team Comparison + Filtered Play-by-Play -->
+      <div class="datacenter-modal-body" id="datacenter-modal-body">
+        <!-- Populated dynamically -->
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>
