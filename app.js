@@ -18,7 +18,7 @@ const ESPN_LEAGUES = [
 const LOL_API_BASE = 'https://esports-api.lolesports.com/persisted/gw';
 const LOL_LIVESTATS_BASE = 'https://feed.lolesports.com/livestats/v1';
 const LOL_PUBLIC_API_KEY = '0TvQnueqKa5mxJntVWt0w4LpLfEkrV1Ta8rQBb9Z';
-const DDRAGON_CHAMPION_CDN = 'https://ddragon.leagueoflegends.com/cdn/14.22.1/img/champion';
+const DDRAGON_CHAMPION_CDN = 'https://ddragon.leagueoflegends.com/cdn/16.22.1/img/champion';
 
 // Riot Official League IDs
 const LOL_WORLDS_LEAGUE_IDS = [
@@ -782,6 +782,7 @@ function getAvailablePeriodsForMatch(match) {
     const count = Math.max(games.length, match.boCount || 3);
     for (let i = 1; i <= count; i++) {
       const gObj = games.find((g) => Number(g.number) === i);
+      if (gObj && gObj.state === 'unneeded') continue;
       const stateTag =
         gObj && gObj.state === 'inProgress'
           ? ' (LIVE)'
@@ -1045,9 +1046,17 @@ function alignTimestampTo10SecISO(ms) {
 }
 
 async function fetchLoLWindowForGame(match, gameObj) {
-  if (!gameObj || !gameObj.id || gameObj.state === 'unstarted') return null;
+  if (!gameObj || !gameObj.id || gameObj.state === 'unstarted' || gameObj.state === 'unneeded') {
+    return null;
+  }
 
-  // 1. First try without startingTime (works immediately for inProgress games)
+  let initialWindow = null;
+  let exactGameStartMs = null;
+
+  // 1. Fetch initial window without startingTime:
+  //    - For inProgress games, this returns the live window directly.
+  //    - For completed games, this returns the 00:00 game-start frame whose `rfc460Timestamp`
+  //      gives the exact second the game started!
   try {
     const directRes = await fetch(`${LOL_LIVESTATS_BASE}/window/${gameObj.id}`, {
       cache: 'no-store',
@@ -1055,21 +1064,37 @@ async function fetchLoLWindowForGame(match, gameObj) {
     if (directRes.ok && directRes.status === 200) {
       const directData = await directRes.json();
       if (directData && Array.isArray(directData.frames) && directData.frames.length > 0) {
-        return directData;
+        initialWindow = directData;
+        const firstTs = directData.frames[0]?.rfc460Timestamp;
+        if (firstTs) {
+          const parsed = new Date(firstTs).getTime();
+          if (!isNaN(parsed)) exactGameStartMs = parsed;
+        }
+        const lastFrame = directData.frames[directData.frames.length - 1];
+        const totalGold =
+          Number(lastFrame?.blueTeam?.totalGold || 0) + Number(lastFrame?.redTeam?.totalGold || 0);
+        // If this is a live game with active gold/stats already populated, return immediately
+        if (gameObj.state === 'inProgress' && totalGold > 5500) {
+          return directData;
+        }
       }
     }
   } catch (_) {}
 
-  // 2. For completed games, Riot livestats requires `startingTime` (10s aligned RFC3339) during the game window.
-  // Probe candidate offsets based on series startTime and game number (Game 1 ~ +25m..+45m, Game 2 ~ +80m..+105m, etc.)
-  const baseMs = match.date instanceof Date && !isNaN(match.date.getTime())
-    ? match.date.getTime()
-    : Date.now() - 7200000;
+  // 2. Query timeline slices (+10m, +18m, +26m, +34m, +44m, +75m) from exactGameStartMs
+  //    +75m guarantees Riot livestats clamps to the `finished` end-of-game scoreboard,
+  //    while earlier slices populate the full mid-game Play-by-Play combat timeline.
   const gIndex = Math.max(0, (Number(gameObj.number) || 1) - 1);
-  const estGameStartMin = gIndex * 54;
-  const offsetsMin = [22, 32, 42, 14, 52].map((m) => estGameStartMin + m);
+  const fallbackBaseMs =
+    (match.date instanceof Date && !isNaN(match.date.getTime())
+      ? match.date.getTime()
+      : Date.now() - 7200000) +
+    gIndex * 54 * 60000;
 
-  const probePromises = offsetsMin.map(async (minOffset) => {
+  const baseMs = exactGameStartMs || fallbackBaseMs;
+  const sliceMinutes = [10, 18, 26, 34, 44, 75];
+
+  const probePromises = sliceMinutes.map(async (minOffset) => {
     const iso = alignTimestampTo10SecISO(baseMs + minOffset * 60000);
     const url = `${LOL_LIVESTATS_BASE}/window/${gameObj.id}?startingTime=${encodeURIComponent(iso)}`;
     const res = await fetch(url, { cache: 'no-store' });
@@ -1082,23 +1107,51 @@ async function fetchLoLWindowForGame(match, gameObj) {
   });
 
   const probeResults = await Promise.allSettled(probePromises);
-  let bestWindow = null;
-  let maxGoldSum = -1;
-
+  const validWindows = [];
   probeResults.forEach((r) => {
     if (r.status === 'fulfilled' && r.value) {
-      const frames = r.value.frames;
-      const last = frames[frames.length - 1];
-      const goldSum =
-        Number(last?.blueTeam?.totalGold || 0) + Number(last?.redTeam?.totalGold || 0);
-      if (goldSum > maxGoldSum) {
-        maxGoldSum = goldSum;
-        bestWindow = r.value;
-      }
+      validWindows.push(r.value);
     }
   });
 
-  return bestWindow;
+  if (validWindows.length === 0) {
+    return initialWindow;
+  }
+
+  // Merge frames chronologically across slices and ensure the highest-gold end-of-game frame is last
+  const frameByTs = new Map();
+  let bestMeta = initialWindow?.gameMetadata || null;
+  let maxGoldFrame = null;
+  let maxGoldVal = -1;
+
+  validWindows.forEach((w) => {
+    if (w.gameMetadata) bestMeta = w.gameMetadata;
+    (w.frames || []).forEach((f) => {
+      const ts = f.rfc460Timestamp || JSON.stringify(f);
+      const gold =
+        Number(f?.blueTeam?.totalGold || 0) + Number(f?.redTeam?.totalGold || 0);
+      if (gold > maxGoldVal) {
+        maxGoldVal = gold;
+        maxGoldFrame = f;
+      }
+      if (!frameByTs.has(ts)) {
+        frameByTs.set(ts, f);
+      }
+    });
+  });
+
+  const mergedFrames = Array.from(frameByTs.values()).sort((a, b) =>
+    String(a.rfc460Timestamp || '').localeCompare(String(b.rfc460Timestamp || ''))
+  );
+
+  if (maxGoldFrame && mergedFrames[mergedFrames.length - 1] !== maxGoldFrame) {
+    mergedFrames.push(maxGoldFrame);
+  }
+
+  return {
+    gameMetadata: bestMeta,
+    frames: mergedFrames,
+  };
 }
 
 async function fetchAndRenderLoLSummary(match) {
@@ -1125,7 +1178,7 @@ async function fetchAndRenderLoLSummary(match) {
     let targetGame = null;
     if (state.selectedPeriod !== 'ALL') {
       const wantedNum = Number(state.selectedPeriod);
-      targetGame = games.find((g) => Number(g.number) === wantedNum) || null;
+      targetGame = games.find((g) => Number(g.number) === wantedNum && g.state !== 'unneeded') || null;
     }
     if (!targetGame) {
       targetGame =
@@ -1157,12 +1210,12 @@ async function fetchAndRenderLoLSummary(match) {
     );
     state.currentSummary = synthesizedSummary;
 
-    if (synthesizedSummary.blueGoldPct && synthesizedSummary.redGoldPct) {
+    if (synthesizedSummary.awayGoldPct && synthesizedSummary.homeGoldPct) {
       updateMomentumUI(
         match.away.abbr,
         match.home.abbr,
-        synthesizedSummary.blueGoldPct,
-        synthesizedSummary.redGoldPct
+        synthesizedSummary.awayGoldPct,
+        synthesizedSummary.homeGoldPct
       );
     }
 
@@ -1183,14 +1236,18 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
   const homeStats = [];
   const leaders = [];
   const boxscorePlayers = [];
-  let blueGoldPct = match.awayWinPct;
-  let redGoldPct = match.homeWinPct;
+  let awayGoldPct = match.awayWinPct;
+  let homeGoldPct = match.homeWinPct;
 
   const activeGameNum = activeGame ? Number(activeGame.number) : 1;
 
-  // 1. Add interactive series game cards so clicking any Game N switches directly to that game's stats!
-  if (Array.isArray(games) && games.length > 0) {
-    games.forEach((g) => {
+  // 1. Add interactive series game cards (excluding unneeded games in finished series)
+  const validGames = Array.isArray(games)
+    ? games.filter((g) => g.state !== 'unneeded')
+    : [];
+
+  if (validGames.length > 0) {
+    validGames.forEach((g) => {
       const gNum = Number(g.number) || 1;
       const gState =
         g.state === 'inProgress'
@@ -1199,15 +1256,13 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
           ? '已完賽'
           : '未開始';
 
-      // Map blue/red side teams for this specific game
       let sideInfo = '';
       if (Array.isArray(g.teams) && g.teams.length >= 2) {
         const bTeamObj = g.teams.find((t) => t.side === 'blue');
-        const rTeamObj = g.teams.find((t) => t.side === 'red');
         const bName =
-          bTeamObj?.id === match.away.id
+          String(bTeamObj?.id) === String(match.away.id)
             ? match.away.abbr
-            : bTeamObj?.id === match.home.id
+            : String(bTeamObj?.id) === String(match.home.id)
             ? match.home.abbr
             : match.away.abbr;
         const rName = bName === match.away.abbr ? match.home.abbr : match.away.abbr;
@@ -1244,39 +1299,64 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
     const meta = windowData.gameMetadata || {};
     const gNumLabel = activeGame ? `Game ${activeGame.number}` : 'LIVE';
 
-    const blueGold = Number(blue.totalGold || 0);
-    const redGold = Number(red.totalGold || 0);
-    if (blueGold + redGold > 0) {
-      blueGoldPct = Math.min(88, Math.max(12, Math.round((blueGold / (blueGold + redGold)) * 100)));
-      redGoldPct = 100 - blueGoldPct;
+    // Determine whether Blue Side in this specific game is match.away or match.home
+    const blueIdFromGame = activeGame?.teams?.find((t) => t.side === 'blue')?.id;
+    const blueIdFromMeta = meta?.blueTeamMetadata?.esportsTeamId;
+    const firstBlueSummoner =
+      meta?.blueTeamMetadata?.participantMetadata?.[0]?.summonerName || '';
+
+    const blueIsHome =
+      (blueIdFromGame && String(blueIdFromGame) === String(match.home.id)) ||
+      (blueIdFromMeta && String(blueIdFromMeta) === String(match.home.id)) ||
+      (firstBlueSummoner &&
+        firstBlueSummoner.toUpperCase().startsWith(match.home.abbr.toUpperCase() + ' '));
+
+    const blueTeamInfo = blueIsHome ? match.home : match.away;
+    const redTeamInfo = blueIsHome ? match.away : match.home;
+
+    const awaySide = blueIsHome ? red : blue;
+    const homeSide = blueIsHome ? blue : red;
+
+    const awayGold = Number(awaySide.totalGold || 0);
+    const homeGold = Number(homeSide.totalGold || 0);
+    if (awayGold + homeGold > 0) {
+      awayGoldPct = Math.min(88, Math.max(12, Math.round((awayGold / (awayGold + homeGold)) * 100)));
+      homeGoldPct = 100 - awayGoldPct;
     }
 
-    const pushStatPair = (label, bVal, rVal) => {
-      awayStats.push({ name: label, label, displayValue: String(bVal) });
-      homeStats.push({ name: label, label, displayValue: String(rVal) });
+    const pushStatPair = (label, aVal, hVal) => {
+      awayStats.push({ name: label, label, displayValue: String(aVal) });
+      homeStats.push({ name: label, label, displayValue: String(hVal) });
     };
 
-    pushStatPair(`${gNumLabel} 總擊殺 (Kills)`, blue.totalKills ?? 0, red.totalKills ?? 0);
+    pushStatPair(`${gNumLabel} 總擊殺 (Kills)`, awaySide.totalKills ?? 0, homeSide.totalKills ?? 0);
     pushStatPair(
       `${gNumLabel} 團隊經濟 (Gold)`,
-      `${(blueGold / 1000).toFixed(1)}k`,
-      `${(redGold / 1000).toFixed(1)}k`
+      `${(awayGold / 1000).toFixed(1)}k`,
+      `${(homeGold / 1000).toFixed(1)}k`
     );
-    pushStatPair(`${gNumLabel} 摧毀防禦塔 (Towers)`, blue.towers ?? 0, red.towers ?? 0);
-    pushStatPair(`${gNumLabel} 巴龍擊殺 (Barons)`, blue.barons ?? 0, red.barons ?? 0);
+    pushStatPair(`${gNumLabel} 摧毀防禦塔 (Towers)`, awaySide.towers ?? 0, homeSide.towers ?? 0);
+    pushStatPair(`${gNumLabel} 巴龍擊殺 (Barons)`, awaySide.barons ?? 0, homeSide.barons ?? 0);
     pushStatPair(
       `${gNumLabel} 元素飛龍 (Dragons)`,
-      Array.isArray(blue.dragons) ? blue.dragons.length : 0,
-      Array.isArray(red.dragons) ? red.dragons.length : 0
+      Array.isArray(awaySide.dragons) ? awaySide.dragons.length : 0,
+      Array.isArray(homeSide.dragons) ? homeSide.dragons.length : 0
     );
-    pushStatPair(`${gNumLabel} 水晶兵營 (Inhibitors)`, blue.inhibitors ?? 0, red.inhibitors ?? 0);
+    pushStatPair(
+      `${gNumLabel} 水晶兵營 (Inhibitors)`,
+      awaySide.inhibitors ?? 0,
+      homeSide.inhibitors ?? 0
+    );
 
-    // Extract frame-by-frame combat events
+    // Extract frame-by-frame combat events across timeline slices
     let prevB = null;
     let prevR = null;
     frames.forEach((f, idx) => {
       const b = f.blueTeam || {};
       const r = f.redTeam || {};
+      const aKills = blueIsHome ? r.totalKills ?? 0 : b.totalKills ?? 0;
+      const hKills = blueIsHome ? b.totalKills ?? 0 : r.totalKills ?? 0;
+
       if (prevB && prevR) {
         const timeTag = f.rfc460Timestamp
           ? new Date(f.rfc460Timestamp).toLocaleTimeString('zh-TW', { hour12: false })
@@ -1289,11 +1369,11 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
             gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
             period: { number: activeGameNum, displayValue: gNumLabel },
-            type: { text: `⚔️ ${gNumLabel} 藍方擊殺` },
-            text: `${match.away.name} 斬獲 ${diff} 顆人頭！本局擊殺比 ${b.totalKills} : ${r.totalKills}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
+            type: { text: `⚔️ ${gNumLabel} 藍方擊殺 (${blueTeamInfo.abbr})` },
+            text: `${blueTeamInfo.fullName} (藍方) 斬獲 ${diff} 顆人頭！本局擊殺比 ${blueTeamInfo.abbr} ${b.totalKills} : ${r.totalKills} ${redTeamInfo.abbr}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
             scoringPlay: true,
-            awayScore: b.totalKills,
-            homeScore: r.totalKills,
+            awayScore: aKills,
+            homeScore: hKills,
           });
         }
         if ((r.totalKills || 0) > (prevR.totalKills || 0)) {
@@ -1303,11 +1383,11 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
             gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
             period: { number: activeGameNum, displayValue: gNumLabel },
-            type: { text: `⚔️ ${gNumLabel} 紅方擊殺` },
-            text: `${match.home.name} 斬獲 ${diff} 顆人頭！本局擊殺比 ${b.totalKills} : ${r.totalKills}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
+            type: { text: `⚔️ ${gNumLabel} 紅方擊殺 (${redTeamInfo.abbr})` },
+            text: `${redTeamInfo.fullName} (紅方) 斬獲 ${diff} 顆人頭！本局擊殺比 ${blueTeamInfo.abbr} ${b.totalKills} : ${r.totalKills} ${redTeamInfo.abbr}（經濟 ${(b.totalGold / 1000).toFixed(1)}k vs ${(r.totalGold / 1000).toFixed(1)}k）`,
             scoringPlay: true,
-            awayScore: b.totalKills,
-            homeScore: r.totalKills,
+            awayScore: aKills,
+            homeScore: hKills,
           });
         }
         if ((b.barons || 0) > (prevB.barons || 0)) {
@@ -1316,11 +1396,11 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
             gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
             period: { number: activeGameNum, displayValue: gNumLabel },
-            type: { text: `🐉 ${gNumLabel} 巴龍擊殺` },
-            text: `${match.away.name} 擊殺納什男爵 (Baron Nashor)！獲得巴龍 Buff 加持！`,
+            type: { text: `🐉 ${gNumLabel} 巴龍擊殺 (${blueTeamInfo.abbr})` },
+            text: `${blueTeamInfo.fullName} 擊殺納什男爵 (Baron Nashor)！獲得巴龍 Buff 推進加成！`,
             scoringPlay: true,
-            awayScore: b.totalKills,
-            homeScore: r.totalKills,
+            awayScore: aKills,
+            homeScore: hKills,
           });
         }
         if ((r.barons || 0) > (prevR.barons || 0)) {
@@ -1329,11 +1409,43 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
             gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
             period: { number: activeGameNum, displayValue: gNumLabel },
-            type: { text: `🐉 ${gNumLabel} 巴龍擊殺` },
-            text: `${match.home.name} 擊殺納什男爵 (Baron Nashor)！獲得巴龍 Buff 加持！`,
+            type: { text: `🐉 ${gNumLabel} 巴龍擊殺 (${redTeamInfo.abbr})` },
+            text: `${redTeamInfo.fullName} 擊殺納什男爵 (Baron Nashor)！獲得巴龍 Buff 推進加成！`,
             scoringPlay: true,
-            awayScore: b.totalKills,
-            homeScore: r.totalKills,
+            awayScore: aKills,
+            homeScore: hKills,
+          });
+        }
+        const bDrag = Array.isArray(b.dragons) ? b.dragons.length : 0;
+        const prevBDrag = Array.isArray(prevB.dragons) ? prevB.dragons.length : 0;
+        if (bDrag > prevBDrag) {
+          const dType = b.dragons[b.dragons.length - 1] || '元素飛龍';
+          plays.push({
+            id: `bd-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
+            clock: { displayValue: timeTag },
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `🐲 ${gNumLabel} 飛龍控制 (${blueTeamInfo.abbr})` },
+            text: `${blueTeamInfo.fullName} 擊殺元素飛龍 (${dType})，本局累積 ${bDrag} 條小龍！`,
+            scoringPlay: false,
+            awayScore: aKills,
+            homeScore: hKills,
+          });
+        }
+        const rDrag = Array.isArray(r.dragons) ? r.dragons.length : 0;
+        const prevRDrag = Array.isArray(prevR.dragons) ? prevR.dragons.length : 0;
+        if (rDrag > prevRDrag) {
+          const dType = r.dragons[r.dragons.length - 1] || '元素飛龍';
+          plays.push({
+            id: `rd-${activeGameNum}-${idx}`,
+            gameNumber: activeGameNum,
+            clock: { displayValue: timeTag },
+            period: { number: activeGameNum, displayValue: gNumLabel },
+            type: { text: `🐲 ${gNumLabel} 飛龍控制 (${redTeamInfo.abbr})` },
+            text: `${redTeamInfo.fullName} 擊殺元素飛龍 (${dType})，本局累積 ${rDrag} 條小龍！`,
+            scoringPlay: false,
+            awayScore: aKills,
+            homeScore: hKills,
           });
         }
         if ((b.towers || 0) > (prevB.towers || 0)) {
@@ -1342,11 +1454,11 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
             gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
             period: { number: activeGameNum, displayValue: gNumLabel },
-            type: { text: `🗼 ${gNumLabel} 防禦塔摧毀` },
-            text: `${match.away.name} 推進成功，本局累計摧毀 ${b.towers} 座防禦塔。`,
+            type: { text: `🗼 ${gNumLabel} 防禦塔摧毀 (${blueTeamInfo.abbr})` },
+            text: `${blueTeamInfo.fullName} 推進成功，本局累計摧毀 ${b.towers} 座防禦塔。`,
             scoringPlay: false,
-            awayScore: b.totalKills,
-            homeScore: r.totalKills,
+            awayScore: aKills,
+            homeScore: hKills,
           });
         }
         if ((r.towers || 0) > (prevR.towers || 0)) {
@@ -1355,11 +1467,11 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
             gameNumber: activeGameNum,
             clock: { displayValue: timeTag },
             period: { number: activeGameNum, displayValue: gNumLabel },
-            type: { text: `🗼 ${gNumLabel} 防禦塔摧毀` },
-            text: `${match.home.name} 推進成功，本局累計摧毀 ${r.towers} 座防禦塔。`,
+            type: { text: `🗼 ${gNumLabel} 防禦塔摧毀 (${redTeamInfo.abbr})` },
+            text: `${redTeamInfo.fullName} 推進成功，本局累計摧毀 ${r.towers} 座防禦塔。`,
             scoringPlay: false,
-            awayScore: b.totalKills,
-            homeScore: r.totalKills,
+            awayScore: aKills,
+            homeScore: hKills,
           });
         }
       }
@@ -1440,15 +1552,15 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
     buildTeamRosterData(
       meta.blueTeamMetadata,
       blue.participants,
-      match.away.abbr,
-      match.away.fullName,
+      blueTeamInfo.abbr,
+      blueTeamInfo.fullName,
       '藍方 Blue'
     );
     buildTeamRosterData(
       meta.redTeamMetadata,
       red.participants,
-      match.home.abbr,
-      match.home.fullName,
+      redTeamInfo.abbr,
+      redTeamInfo.fullName,
       '紅方 Red'
     );
   }
@@ -1476,8 +1588,8 @@ function buildLoLSummaryFromRiotData(match, eventDetail, games, activeGame, wind
       players: boxscorePlayers,
     },
     leaders,
-    blueGoldPct,
-    redGoldPct,
+    awayGoldPct,
+    homeGoldPct,
   };
 }
 
@@ -1750,7 +1862,7 @@ function buildPlayerBoxscoreHTML(match, summaryData) {
         <div class="boxscore-team-section">
           <div class="boxscore-team-header ${idx > 0 ? 'home-header' : ''}">
             <span>${escapeHtml(teamTitle)}</span>
-            <span>${idx === 0 ? escapeHtml(match.away.abbr) : escapeHtml(match.home.abbr)}</span>
+            <span>${escapeHtml(teamObj.abbreviation || (idx === 0 ? match.away.abbr : match.home.abbr))}</span>
           </div>
           ${tablesHtml}
         </div>
